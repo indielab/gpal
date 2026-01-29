@@ -169,13 +169,17 @@ def _consult_impl(query: str, session_id: str, model_alias: str, file_paths: Lis
 @mcp.tool()
 def consult_gemini_flash(query: str, session_id: str = "default", file_paths: List[str] = []) -> str:
     """
-    Consults Gemini 3 Flash (Fast/Efficient). 
+    Consults Gemini 3 Flash (Fast/Efficient).
     
     IMPORTANT: Gemini has its own tools to list directories, read files, and search the project 
-    autonomously. You do not need to provide all file contents; Gemini will explore the codebase 
-    itself to answer your query.
+    autonomously. You do not need to provide all file contents.
     
-    Use for: Quick lookups, summarizing files, simple questions, and initial exploration.
+    PRIMARY USE: High-speed exploration and context gathering. Use this tool FIRST to:
+    1. Map out the project structure (list_directory).
+    2. Locate specific code (search_project).
+    3. Read and summarize files (read_file).
+    
+    Once the relevant context is gathered, switch to 'consult_gemini_pro' for deep analysis.
     
     Args:
         query: The question or instruction.

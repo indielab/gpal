@@ -11,8 +11,8 @@
 *   **Nested Agency:** You can ask your host model (e.g. Claude) to "Ask Gemini to find the bug," and Claude will delegate the entire exploration and analysis task to Gemini.
 *   **Massive Context Window:** Leverages Gemini 3's 2M token context window to ingest entire modules, large files, or extensive documentation sets.
 *   **Multi-Tier Consultation:** Choose between speed and depth:
-    *   `consult_gemini_flash`: For quick lookups, file summaries, and initial exploration. Fast and efficient.
-    *   `consult_gemini_pro`: For complex architectural reviews, security auditing, deep debugging, and synthesis. Slower but provides deeper reasoning.
+    *   `consult_gemini_flash`: **The Scout.** Optimized for exploration, searching, and context gathering. Use this *first* to map the codebase and find the right files.
+    *   `consult_gemini_pro`: **The Architect.** Optimized for deep reasoning and synthesis. Use this *after* Flash has found the relevant context to perform complex audits or architectural reviews.
     *   **Seamless Switching:** Conversation history is preserved when switching between Flash and Pro for the same `session_id`.
 *   **Open Standard:** Built on MCP, making it compatible with Claude Desktop, Cursor, VS Code, and other MCP clients.
 
