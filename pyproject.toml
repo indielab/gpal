@@ -1,0 +1,23 @@
+[project]
+name = "gpal"
+version = "0.1.0"
+description = "A 'Second Brain' MCP server using Google Gemini"
+readme = "README.md"
+authors = [
+    { name = "A Tobey", email = "tobert@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.14.4",
+    "google-genai>=1.60.0",
+    "mcp[cli]>=1.26.0",
+    "pytest>=9.0.2",
+    "python-dotenv>=1.2.1",
+]
+
+[project.scripts]
+gpal = "gpal.server:main"
+
+[build-system]
+requires = ["uv_build>=0.9.3,<0.10.0"]
+build-backend = "uv_build"
