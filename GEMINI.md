@@ -1,6 +1,7 @@
 # gpal (Gemini Principal Assistant Layer)
 
-`gpal` is a Model Context Protocol (MCP) server designed to act as a "Second Brain" for software engineering. It provides a stateful, context-aware interface to Google's Gemini 3 models (Principal Software Engineer persona).
+`gpal` is a Model Context Protocol (MCP) server designed to act as a "Second Brain" for agentic workflows.
+It provides a stateful, context-aware interface to Google's Gemini 3 models.
 
 ## Project Structure
 
@@ -37,7 +38,7 @@
 ## Capabilities
 
 ### Tool: `consult_gemini`
-*   **Persona:** Principal Software Engineer.
+*   **Persona:** Minimal
 *   **Stateful:** Uses `session_id` to maintain multi-turn conversations.
 *   **Multi-Model:** Supports seamless switching between models within a session.
     *   `model="flash"` (Default): Gemini 3 Flash Preview (Fast, efficient).

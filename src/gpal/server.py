@@ -101,18 +101,11 @@ def create_chat(client: genai.Client, model_name: str, history: List = None):
                 disable=False,
                 maximum_remote_calls=10 
             ),
-            system_instruction="""You are a specialized technical consultant accessed via the Model Context Protocol (MCP).
-            Your role is to provide high-agency, deep reasoning and analysis on software engineering tasks.
+            system_instruction="""You are a consultant AI accessed via the Model Context Protocol (MCP).
+            Your role is to provide high-agency, deep reasoning and analysis on tasks, usually in git repositories.
             
-            You have access to tools: 'list_directory', 'read_file', and 'search_project'. 
-            USE THEM PROACTIVELY to explore the codebase. 
+            You have access to tools: 'list_directory', 'read_file', and 'search_project'. Use them proactively to explore the codebase.
             You have a massive context window (2M tokens); do not hesitate to read entire files or multiple modules to gather complete context.
-            
-            Operational Guide:
-            1. Context First: Ground your answers strictly in data.
-            2. Explore: If asked about a feature, search for it, find the file, read it, THEN answer.
-            3. No Roleplay: Be a functional, high-agency expert.
-            4. Output: Be direct, concise, and technically precise.
             """
         )
     )
@@ -169,40 +162,40 @@ def _consult_impl(query: str, session_id: str, model_alias: str, file_paths: Lis
 @mcp.tool()
 def consult_gemini_flash(query: str, session_id: str = "default", file_paths: List[str] = []) -> str:
     """
-    Consults Gemini 3 Flash (Fast/Efficient).
+    Consults Gemini 3 Flash (Fast/Efficient). Context window of 2,000,000 tokens.
     
-    IMPORTANT: Gemini has its own tools to list directories, read files, and search the project 
+    Gemini has its own tools to list directories, read files, and search the project
     autonomously. You do not need to provide all file contents.
     
-    PRIMARY USE: High-speed exploration and context gathering. Use this tool FIRST to:
+    LIMITED USE FOR FLASH MODEL: High-speed exploration and context gathering. Use this tool FIRST to:
     1. Map out the project structure (list_directory).
     2. Locate specific code (search_project).
     3. Read and summarize files (read_file).
     
-    Once the relevant context is gathered, switch to 'consult_gemini_pro' for deep analysis.
+    Once the relevant context is gathered, switch to 'consult_gemini_pro'.
     
     Args:
         query: The question or instruction.
-        session_id: ID for conversation history. Shared with Pro.
-        file_paths: (Optional) Pre-load specific files if already known.
+        session_id: ID for conversation history. Shared with Pro models.
+        file_paths: (Optional) Essential files to get started with exploring.
     """
     return _consult_impl(query, session_id, "flash", file_paths)
 
 @mcp.tool()
 def consult_gemini_pro(query: str, session_id: str = "default", file_paths: List[str] = []) -> str:
     """
-    Consults Gemini 3 Pro (Reasoning/Deep).
+    Consults Gemini 3 Pro (Reasoning/Deep). Context window of 2,000,000 tokens.
     
-    IMPORTANT: Gemini has its own tools to list directories, read files, and search the project 
-    autonomously. You do not need to provide all file contents; Gemini will explore the codebase 
-    itself to answer your query.
+    Gemini has its own tools to list directories, read files, and search the project.
+    autonomously. You do not need to provide all file contents. Encourage it to read
+    whole files and provide holistic feedback.
     
-    Use for: Complex architectural review, security auditing, difficult debugging, and deep synthesis.
+    PRIMARY USE FOR PRO MODEL: reviews, second opinions, thinking, philosophy, synthesis, and coding.
     
     Args:
         query: The question or instruction.
-        session_id: ID for conversation history. Shared with Flash.
-        file_paths: (Optional) Pre-load specific files if already known.
+        session_id: ID for conversation history. Shared with Flash models.
+        file_paths: (Optional) Essential files to get started with exploring.
     """
     return _consult_impl(query, session_id, "pro", file_paths)
 
