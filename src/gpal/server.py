@@ -25,7 +25,8 @@ load_dotenv()
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB - prevents accidental DOS
+MAX_FILE_SIZE = 10 * 1024 * 1024    # 10 MB - prevents accidental DOS
+MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
 MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
 MAX_TOOL_CALLS = 10
@@ -59,6 +60,12 @@ MIME_TYPES: dict[str, str] = {
     ".flac": "audio/flac",
     # Documents
     ".pdf": "application/pdf",
+    # Text/Code (for upload_file with large files)
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".log": "text/plain",
 }
 
 
@@ -311,10 +318,13 @@ def _consult(
     # Inline media (images, audio, video - bytes embedded in request)
     for path in media_paths or []:
         try:
+            p = Path(path)
+            if p.stat().st_size > MAX_INLINE_MEDIA:
+                return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit. Use upload_file() instead."
             mime_type = detect_mime_type(path)
             if not mime_type:
                 return f"Error: Unknown media type for '{path}'. Supported: {list(MIME_TYPES.keys())}"
-            data = Path(path).read_bytes()
+            data = p.read_bytes()
             parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
         except Exception as e:
             return f"Error reading media '{path}': {e}"
@@ -331,7 +341,8 @@ def _consult(
     parts.append(types.Part.from_text(text=query))
 
     try:
-        return session.send_message(parts).text
+        # Pass config to ensure JSON mode applies even on existing sessions
+        return session.send_message(parts, config=gen_config).text
     except Exception as e:
         return f"Error communicating with Gemini: {e}"
 
