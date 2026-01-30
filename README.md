@@ -85,45 +85,6 @@ Then ask your AI assistant:
 
 > "Use `consult_gemini_flash` to find where errors are handled"
 
-### Programmatic Usage
-
-> **Note:** Sessions live in memory. When used as a library (not MCP server), state is lost when the script exits.
-
-```python
-from gpal.server import consult_gemini_flash, consult_gemini_pro, upload_file
-
-# Flash: Quick exploration
-result = consult_gemini_flash.fn(
-    "What files are in the src directory?",
-    session_id="review-1"
-)
-
-# Pro: Deep analysis (same session, history preserved)
-analysis = consult_gemini_pro.fn(
-    "Based on those files, explain the architecture",
-    session_id="review-1"
-)
-
-# Multimodal: Analyze screenshots or diagrams
-review = consult_gemini_pro.fn(
-    "What's wrong with this UI?",
-    media_paths=["screenshot.png"]
-)
-
-# File upload: For large files (videos, big PDFs)
-uri = upload_file.fn("demo.mp4")
-feedback = consult_gemini_pro.fn(
-    "Review this product demo",
-    file_uris=[uri.split(": ")[1].split(" ")[0]]  # extract URI
-)
-
-# JSON mode: Structured output
-data = consult_gemini_flash.fn(
-    "List the top 5 largest functions",
-    json_mode=True
-)
-```
-
 ## Development
 
 ```bash
