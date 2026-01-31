@@ -11,17 +11,47 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import glob as globlib
+from cachetools import TTLCache
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from google import genai
+from google.api_core.exceptions import (
+    InternalServerError,
+    ResourceExhausted,
+    ServiceUnavailable,
+)
 from google.genai import types
-from google.genai.types import Tool, GoogleSearch, ToolCodeExecution
+from google.genai.types import GoogleSearch, Tool, ToolCodeExecution
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
+# Configure retry decorator for Gemini API calls
+GEMINI_RETRY_DECORATOR = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type(
+        (ServiceUnavailable, ResourceExhausted, InternalServerError)
+    ),
+    before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
+    reraise=True,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -92,8 +122,6 @@ modules when needed to gather complete context.
 # ─────────────────────────────────────────────────────────────────────────────
 # Server & State
 # ─────────────────────────────────────────────────────────────────────────────
-
-from cachetools import TTLCache
 
 mcp = FastMCP("gpal")
 sessions: TTLCache = TTLCache(maxsize=100, ttl=3600)  # 1 hour TTL
@@ -290,64 +318,94 @@ def get_session(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@GEMINI_RETRY_DECORATOR
 def _gemini_search(
     query: str,
     num_results: int = 5,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-2.0-flash",
 ) -> str:
-    """Internal implementation of web search."""
+    """Internal implementation of web search with automatic retry on 503/429."""
     try:
         client = get_client()
+
+        # Clamp num_results
         num_results = max(1, min(num_results, MAX_SEARCH_RESULTS))
 
+        # Single stateless API call with Google Search tool
         response = client.models.generate_content(
             model=model,
             contents=f"Search for: {query}\n\nProvide the top {num_results} most relevant results with titles, URLs, and summaries.",
             config=types.GenerateContentConfig(
                 tools=[Tool(google_search=GoogleSearch())],
-                temperature=0.1,
+                temperature=0.1,  # More focused for search
             ),
         )
 
+        # Extract text response
         if response.candidates and response.candidates[0].content.parts:
-            text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p, 'text') and p.text)
-            return text.strip() or "No results returned."
-        
+            result_text = ""
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, "text"):
+                    result_text += part.text
+            return result_text.strip() or "No results returned."
+
         return "No results returned."
+
+    except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
+        # Re-raise for tenacity to retry
+        logging.warning(f"Search request failed with {type(e).__name__}: {e}")
+        raise
     except Exception as e:
+        # Don't retry on other exceptions (auth errors, invalid requests, etc.)
         return f"Error performing search: {e}"
 
 
+@GEMINI_RETRY_DECORATOR
 def _gemini_code_exec(
     code: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-2.0-flash",
 ) -> str:
-    """Internal implementation of code execution."""
+    """
+    Internal implementation of code execution with automatic retry on 503/429.
+
+    Note: Code execution service can be more resource-constrained than
+    general text generation, so transient 503 errors are more common.
+    """
     try:
         client = get_client()
+
+        # Single stateless API call with Code Execution tool
         response = client.models.generate_content(
             model=model,
             contents=f"Execute this Python code and show the output:\n\n```python\n{code}\n```",
             config=types.GenerateContentConfig(
                 tools=[Tool(code_execution=ToolCodeExecution())],
-                temperature=0,
+                temperature=0,  # Deterministic for code execution
             ),
         )
 
-        output = []
+        # Extract execution results
         if response.candidates and response.candidates[0].content.parts:
+            result_text = ""
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text:
-                    output.append(part.text)
-                if part.executable_code:
-                    output.append(f"\nExecuted Code:\n{part.executable_code.code}\n")
-                if part.code_execution_result:
-                    output.append(f"\nOutput:\n{part.code_execution_result.output}\n")
-            
-            return "".join(output).strip() or "Code executed (no output)."
-        
+                # Code execution results come in executable_code or code_execution_result
+                if hasattr(part, "text"):
+                    result_text += part.text
+                elif hasattr(part, "executable_code"):
+                    result_text += f"Executed:\n{part.executable_code.code}\n"
+                elif hasattr(part, "code_execution_result"):
+                    result_text += f"Output:\n{part.code_execution_result.output}\n"
+
+            return result_text.strip() or "Code executed (no output)."
+
         return "Code executed (no output)."
+
+    except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
+        # Re-raise for tenacity to retry
+        logging.warning(f"Code execution request failed with {type(e).__name__}: {e}")
+        raise
     except Exception as e:
+        # Don't retry on other exceptions
         return f"Error executing code: {e}"
 
 def _consult(
@@ -417,10 +475,28 @@ def _consult(
 
     parts.append(types.Part.from_text(text=query))
 
-    try:
-        return session.send_message(parts, config=gen_config).text
-    except Exception as e:
-        return f"Error: {e}"
+    # Apply retry logic to the send_message call
+    max_retries = 3
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return session.send_message(parts, config=gen_config).text
+        except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+                logging.warning(
+                    f"Consult attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                logging.error(f"All {max_retries} consult attempts failed: {e}")
+        except Exception as e:
+            # Don't retry on non-transient errors
+            return f"Error: {e}"
+
+    return f"Error: Service temporarily unavailable after {max_retries} attempts: {last_exception}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
