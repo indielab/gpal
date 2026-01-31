@@ -16,5 +16,17 @@ wheels/
 .idea/
 .vscode/
 
-# gpal specific
-.gpal-api-key.gemini/
+# API keys and secrets
+*api_key*
+*api-key*
+*.secret
+credentials.json
+oauth_creds.json
+google_accounts.json
+
+# Gemini CLI (may contain keys in settings)
+.gemini/
+
+# Claude Code local settings
+.claude/settings.local.json
+CLAUDE.local.md
