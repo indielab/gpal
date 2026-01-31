@@ -269,8 +269,14 @@ def rebuild_index(path: str = ".") -> str:
     """
     try:
         index = get_index(path)
-        count = index.rebuild()
-        return f"Indexed {count} files. Index stored at: {index.db_path}"
+        result = index.rebuild()
+        indexed = result.get("indexed", 0)
+        skipped = result.get("skipped", 0)
+        removed = result.get("removed", 0)
+        return (
+            f"Index rebuilt: {indexed} indexed, {skipped} unchanged, {removed} removed. "
+            f"Stored at: {index.db_path}"
+        )
     except Exception as e:
         return f"Error rebuilding index: {e}"
 

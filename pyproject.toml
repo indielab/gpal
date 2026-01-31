@@ -18,14 +18,16 @@ classifiers = [
 dependencies = [
     "chromadb>=0.4",
     "fastmcp>=2.14.4",
+    "google-api-core>=2.0",
     "google-genai>=1.60.0",
     "mcp[cli]>=1.26.0",
     "pathspec>=0.11",
     "python-dotenv>=1.2.1",
+    "tenacity>=8.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0.2"]
+dev = ["pytest>=9.0.2", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 gpal = "gpal.server:main"

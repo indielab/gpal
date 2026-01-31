@@ -57,9 +57,11 @@ Gemini catches real issues — see git history for proof.
 gpal/
 ├── src/gpal/
 │   ├── __init__.py       # Package metadata (__version__)
+│   ├── index.py          # Semantic search index (chromadb + Gemini embeddings)
 │   └── server.py         # MCP server + all logic
 ├── tests/
 │   ├── test_tools.py     # Unit tests (pytest)
+│   ├── test_index.py     # Index unit tests
 │   ├── test_agentic.py   # Manual: autonomous exploration
 │   ├── test_connectivity.py  # Manual: API ping
 │   └── test_switching.py     # Manual: Flash→Pro history
@@ -91,6 +93,36 @@ Sessions live in memory (`sessions` dict). Same `session_id` = same conversation
 | `MAX_SEARCH_MATCHES` | 20 | Truncates search results |
 | `MAX_TOOL_CALLS` | 10 | Limits autonomous tool use per response |
 
+### Semantic Search Index (index.py)
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `CHUNK_SIZE` | 50 lines | Lines per code chunk |
+| `CHUNK_OVERLAP` | 10 lines | Overlap between chunks for context |
+| `EMBEDDING_MODEL` | `gemini-embedding-001` | Gemini embedding model |
+| `EMBEDDING_BATCH_SIZE` | 100 | Max chunks per API call |
+| `RATE_LIMIT_DELAY` | 50ms | Delay between API batches |
+| `MAX_RETRIES` | 3 | Retry attempts on 429 errors |
+| `MAX_CONCURRENT_EMBEDS` | 10 | Concurrent embedding requests |
+
+**Features**:
+- **Incremental indexing**: Only re-indexes files that changed (by mtime/size)
+- **Async concurrency**: Parallel embedding requests with semaphore control
+- **Rate limiting**: Automatic retry on 429 errors with exponential backoff
+- **Dry run mode**: Count files/chunks without API calls
+- **Max files limit**: Cap indexing for testing/budget control
+
+**Usage in MCP tools**:
+```python
+# rebuild_index() uses these options internally:
+result = index.rebuild(
+    force=False,      # True = full rebuild, False = incremental
+    dry_run=False,    # True = count only, no API calls
+    max_files=None,   # Limit files to index (for testing)
+)
+# Returns: {"indexed": N, "skipped": M, "removed": K}
+```
+
 ## Testing
 
 ```bash
@@ -98,7 +130,7 @@ Sessions live in memory (`sessions` dict). Same `session_id` = same conversation
 uv sync --all-extras
 
 # Unit tests (no API key needed)
-uv run pytest tests/test_tools.py -v
+uv run pytest tests/test_tools.py tests/test_index.py -v
 
 # Manual integration tests (requires GEMINI_API_KEY)
 export GEMINI_API_KEY="..."

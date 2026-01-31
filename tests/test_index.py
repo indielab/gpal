@@ -13,7 +13,11 @@ from gpal.index import (
     CHUNK_OVERLAP,
     BINARY_EXTENSIONS,
     EMBEDDING_BATCH_SIZE,
+    EMBEDDING_MODEL,
+    MAX_CONCURRENT_EMBEDS,
     MAX_FILE_SIZE,
+    MAX_RETRIES,
+    RATE_LIMIT_DELAY,
 )
 
 
@@ -240,3 +244,224 @@ def test_max_file_size():
 def test_embedding_batch_size():
     """Verify EMBEDDING_BATCH_SIZE is reasonable for API limits."""
     assert 50 <= EMBEDDING_BATCH_SIZE <= 250, "Batch size should be within typical API limits"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rate Limiting & Retry Constants Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rate_limit_constants():
+    """Verify rate limiting constants are reasonable."""
+    assert RATE_LIMIT_DELAY >= 0.01, "Rate limit delay should be at least 10ms"
+    assert RATE_LIMIT_DELAY <= 1.0, "Rate limit delay shouldn't be too long"
+    assert MAX_RETRIES >= 1, "Should retry at least once"
+    assert MAX_RETRIES <= 10, "Shouldn't retry too many times"
+
+
+def test_concurrency_constant():
+    """Verify concurrency limit is reasonable."""
+    assert MAX_CONCURRENT_EMBEDS >= 1, "Should allow at least 1 concurrent request"
+    assert MAX_CONCURRENT_EMBEDS <= 50, "Shouldn't overwhelm the API"
+
+
+def test_embedding_model():
+    """Verify embedding model is set to the newer model."""
+    assert EMBEDDING_MODEL == "gemini-embedding-001", "Should use newer embedding model"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Incremental Indexing Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_file_needs_reindex_new_file(simple_index, tmp_path):
+    """New files always need reindexing."""
+    new_file = tmp_path / "new.py"
+    new_file.write_text("print('hello')")
+    assert simple_index._file_needs_reindex(new_file) is True
+
+
+def test_file_needs_reindex_nonexistent(simple_index, tmp_path):
+    """Non-existent files don't need reindexing."""
+    nonexistent = tmp_path / "nonexistent.py"
+    assert simple_index._file_needs_reindex(nonexistent) is False
+
+
+def test_get_file_metadata_not_indexed(simple_index, tmp_path):
+    """Files not yet indexed return None for metadata."""
+    test_file = tmp_path / "test.py"
+    test_file.write_text("content")
+
+    # Mock meta_collection to return empty result
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": [], "metadatas": []}
+
+    assert simple_index._get_file_metadata(test_file) is None
+
+
+def test_update_file_metadata(simple_index, tmp_path):
+    """File metadata can be stored and retrieved."""
+    test_file = tmp_path / "test.py"
+    test_file.write_text("content")
+
+    # Mock the chromadb collection
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": []}
+
+    simple_index._update_file_metadata(test_file, 3)
+
+    # Verify add was called with correct data
+    simple_index.meta_collection.add.assert_called_once()
+    call_kwargs = simple_index.meta_collection.add.call_args
+    assert "test.py" in call_kwargs.kwargs["ids"]
+    metadata = call_kwargs.kwargs["metadatas"][0]
+    assert metadata["chunk_count"] == 3
+    assert "mtime" in metadata
+    assert "size" in metadata
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dry Run Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rebuild_dry_run_returns_expected_keys(simple_index, tmp_path):
+    """Dry run returns expected dict keys."""
+    # Create some test files
+    (tmp_path / "file1.py").write_text("print('hello')")
+    (tmp_path / "file2.py").write_text("print('world')")
+
+    # Mock the collection to avoid actual chromadb operations
+    simple_index.collection = MagicMock()
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": []}
+
+    result = simple_index.rebuild(dry_run=True)
+
+    assert "indexed" in result
+    assert "skipped" in result
+    assert "removed" in result
+    assert "chunks" in result
+    assert result.get("dry_run") is True
+
+
+def test_rebuild_dry_run_counts_files_and_chunks(simple_index, tmp_path):
+    """Dry run correctly counts files and chunks."""
+    # Create test files with known line counts
+    (tmp_path / "small.py").write_text("line1\nline2\nline3")  # 1 chunk
+    (tmp_path / "medium.py").write_text("\n".join([f"line{i}" for i in range(60)]))  # Multiple chunks
+
+    simple_index.collection = MagicMock()
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": []}
+
+    result = simple_index.rebuild(dry_run=True)
+
+    assert result["indexed"] == 2
+    assert result["chunks"] > 0
+    assert result["dry_run"] is True
+
+
+def test_rebuild_dry_run_no_api_calls(simple_index, tmp_path, mock_client):
+    """Dry run should not make any API calls."""
+    (tmp_path / "test.py").write_text("content")
+
+    simple_index.collection = MagicMock()
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": []}
+
+    simple_index.rebuild(dry_run=True)
+
+    # Client embed methods should not be called
+    mock_client.models.embed_content.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Max Files Limit Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rebuild_max_files_limit(simple_index, tmp_path):
+    """max_files parameter limits the number of files indexed."""
+    # Create more files than the limit
+    for i in range(10):
+        (tmp_path / f"file{i}.py").write_text(f"print({i})")
+
+    simple_index.collection = MagicMock()
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": []}
+
+    result = simple_index.rebuild(dry_run=True, max_files=3)
+
+    assert result["indexed"] == 3
+
+
+def test_rebuild_max_files_none_indexes_all(simple_index, tmp_path):
+    """max_files=None indexes all files."""
+    for i in range(5):
+        (tmp_path / f"file{i}.py").write_text(f"print({i})")
+
+    simple_index.collection = MagicMock()
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": []}
+
+    result = simple_index.rebuild(dry_run=True, max_files=None)
+
+    assert result["indexed"] == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Progress Callback Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rebuild_progress_callback_called(simple_index, tmp_path):
+    """Progress callback is called during rebuild."""
+    (tmp_path / "test.py").write_text("content")
+
+    simple_index.collection = MagicMock()
+    simple_index.meta_collection = MagicMock()
+    simple_index.meta_collection.get.return_value = {"ids": []}
+
+    progress_messages = []
+
+    def callback(msg):
+        progress_messages.append(msg)
+
+    simple_index.rebuild(dry_run=True, progress_callback=callback)
+
+    assert len(progress_messages) > 0
+    # Should contain "Dry run" since we're in dry_run mode
+    assert any("Dry run" in msg for msg in progress_messages)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Force Rebuild Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rebuild_force_clears_collections(simple_index, tmp_path):
+    """force=True should delete collections before recreating them."""
+    (tmp_path / "test.py").write_text("content")
+
+    # Track collection deletions
+    deleted_collections = []
+
+    def track_delete(name):
+        deleted_collections.append(name)
+
+    # Mock chroma client
+    simple_index.chroma = MagicMock()
+    simple_index.chroma.delete_collection.side_effect = track_delete
+    mock_collection = MagicMock()
+    mock_collection.get.return_value = {"ids": []}
+    simple_index.chroma.create_collection.return_value = mock_collection
+
+    # Note: force=True without dry_run should call delete_collection
+    # (dry_run=True skips the deletion)
+    simple_index._rebuild_sync(force=True, dry_run=False)
+
+    # Should have deleted both collections
+    assert "code" in deleted_collections
+    assert "file_metadata" in deleted_collections
