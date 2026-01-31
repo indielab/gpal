@@ -3,35 +3,43 @@ import pytest
 from pathlib import Path
 from gpal.server import list_directory, read_file, search_project, detect_mime_type, MIME_TYPES
 
-def test_list_directory(tmp_path):
+def test_list_directory(tmp_path, monkeypatch):
     # Create a dummy structure
     (tmp_path / "subdir").mkdir()
     (tmp_path / "file1.txt").write_text("hello")
     (tmp_path / "file2.py").write_text("print('world')")
-    
-    # Test listing
-    results = list_directory(str(tmp_path))
+
+    # Change cwd so tmp_path is within "project root"
+    monkeypatch.chdir(tmp_path)
+
+    # Test listing current directory
+    results = list_directory(".")
     assert "subdir" in results
     assert "file1.txt" in results
     assert "file2.py" in results
     assert len(results) == 3
 
-def test_list_directory_nonexistent():
-    results = list_directory("/non/existent/path/at/all")
+def test_list_directory_nonexistent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    results = list_directory("non_existent_subdir")
     assert len(results) == 1
-    assert "Error" in results[0]
+    assert "does not exist" in results[0]
 
-def test_read_file(tmp_path):
+def test_read_file(tmp_path, monkeypatch):
     test_file = tmp_path / "test.txt"
     content = "Sample content for testing."
     test_file.write_text(content)
-    
-    result = read_file(str(test_file))
+
+    # Change cwd so tmp_path is within "project root"
+    monkeypatch.chdir(tmp_path)
+
+    result = read_file("test.txt")
     assert result == content
 
-def test_read_file_error():
+def test_read_file_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     result = read_file("this_file_does_not_exist_at_all.txt")
-    assert "Error reading file" in result
+    assert "does not exist" in result
 
 def test_search_project(tmp_path, monkeypatch):
     # Setup dummy files
