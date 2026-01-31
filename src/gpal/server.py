@@ -93,6 +93,7 @@ modules when needed to gather complete context.
 mcp = FastMCP("gpal")
 sessions: dict[str, Any] = {}
 uploaded_files: dict[str, types.File] = {}  # Cache for Gemini File API uploads
+_indexes: dict = {}  # Cache for semantic search indexes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini Internal Tools (for autonomous exploration)
@@ -168,6 +169,16 @@ def get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+def get_index(root: str = "."):
+    """Get or create a semantic search index for a project root."""
+    from gpal.index import CodebaseIndex  # lazy import
+    root_path = Path(root).resolve()
+    key = str(root_path)
+    if key not in _indexes:
+        _indexes[key] = CodebaseIndex(root_path, get_client())
+    return _indexes[key]
+
+
 @mcp.tool()
 def upload_file(file_path: str, display_name: str | None = None) -> str:
     """
@@ -205,6 +216,63 @@ def upload_file(file_path: str, display_name: str | None = None) -> str:
         return f"Uploaded: {file.uri} (expires in 48h)"
     except Exception as e:
         return f"Error uploading file: {e}"
+
+
+@mcp.tool()
+def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
+    """
+    Find code semantically related to the query using vector embeddings.
+
+    Unlike text search, this finds code by meaning. "auth logic" finds
+    verify_jwt_token() even without exact keyword matches.
+
+    Args:
+        query: Natural language description of what you're looking for.
+        limit: Maximum results to return (default 5).
+        path: Project root to search (default: current directory).
+
+    Returns:
+        Matching code chunks with file paths, line numbers, and relevance scores.
+    """
+    try:
+        index = get_index(path)
+        results = index.search(query, limit)
+        if not results:
+            return "No matches found. Try rebuilding the index with rebuild_index()."
+
+        output = []
+        for r in results:
+            output.append(f"**{r['file']}:{r['lines']}** (score: {r['score']})")
+            output.append(f"```\n{r['snippet']}\n```\n")
+        return "\n".join(output)
+    except Exception as e:
+        return f"Error searching: {e}"
+
+
+@mcp.tool()
+def rebuild_index(path: str = ".") -> str:
+    """
+    Rebuild the semantic search index for a codebase.
+
+    Run this when:
+    - First time using semantic search on a project
+    - After major code changes
+    - If search results seem stale
+
+    Index is stored in ~/.local/share/gpal/index/ (XDG compliant).
+
+    Args:
+        path: Project root to index (default: current directory).
+
+    Returns:
+        Summary of indexed files.
+    """
+    try:
+        index = get_index(path)
+        count = index.rebuild()
+        return f"Indexed {count} files. Index stored at: {index.db_path}"
+    except Exception as e:
+        return f"Error rebuilding index: {e}"
 
 
 def create_chat(

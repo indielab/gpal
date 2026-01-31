@@ -16,9 +16,11 @@ classifiers = [
 ]
 
 dependencies = [
+    "chromadb>=0.4",
     "fastmcp>=2.14.4",
     "google-genai>=1.60.0",
     "mcp[cli]>=1.26.0",
+    "pathspec>=0.11",
     "python-dotenv>=1.2.1",
 ]
 
