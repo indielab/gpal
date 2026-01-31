@@ -76,12 +76,16 @@ Sessions live in memory (`sessions` dict). Same `session_id` = same conversation
 
 ⚠️ **Limitation**: Sessions are not persisted. Server restart = fresh state.
 
-### Two-Tier Model Strategy
+### Model Strategy
+
+We always prefer the latest and most capable models available from Google.
 
 | Model | Alias | Best For |
 |-------|-------|----------|
 | `gemini-3-flash-preview` | `flash` | Fast exploration, searching, listing |
 | `gemini-3-pro-preview` | `pro` | Deep reasoning, synthesis, code review |
+| `imagen-4.0-generate-001` | `image` | High-fidelity image generation |
+| `gemini-2.5-flash-preview-tts` | `speech` | Text-to-speech synthesis |
 
 ### Safety Limits
 

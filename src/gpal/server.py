@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,7 @@ modules when needed to gather complete context.
 
 mcp = FastMCP("gpal")
 sessions: dict[str, Any] = {}
+sessions_lock = threading.Lock()
 uploaded_files: dict[str, types.File] = {}  # Cache for Gemini File API uploads
 _indexes: dict = {}  # Cache for semantic search indexes
 
@@ -281,6 +283,82 @@ def rebuild_index(path: str = ".") -> str:
         return f"Error rebuilding index: {e}"
 
 
+@mcp.tool()
+def generate_image(prompt: str, output_path: str) -> str:
+    """
+    Generates an image using Imagen 3 models.
+
+    Args:
+        prompt: The image description.
+        output_path: Path to save the generated image (e.g., "assets/image.png").
+    """
+    client = get_client()
+    try:
+        # Create parent directories if they don't exist
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        response = client.models.generate_images(
+            model="imagen-4.0-generate-001",
+            prompt=prompt,
+            config=types.GenerateImagesConfig(
+                number_of_images=1,
+            )
+        )
+        if response.generated_images:
+            image_bytes = response.generated_images[0].image.image_bytes
+            Path(output_path).write_bytes(image_bytes)
+            return f"Image generated and saved to {output_path}"
+        return "No image generated."
+    except Exception as e:
+        return f"Error generating image: {e}"
+
+
+@mcp.tool()
+def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> str:
+    """
+    Synthesizes speech from text.
+
+    Args:
+        text: The text to convert to speech.
+        output_path: Path to save the audio file (e.g., "assets/speech.wav").
+        voice_name: Voice to use (e.g., "Puck", "Charon", "Kore", "Fenrir", "Aoede").
+    """
+    client = get_client()
+    try:
+        # Create parent directories if they don't exist
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_name
+                        )
+                    )
+                )
+            )
+        )
+
+        audio_bytes = b""
+        if response.candidates:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data and "audio" in part.inline_data.mime_type:
+                    audio_bytes += part.inline_data.data
+
+        if audio_bytes:
+            Path(output_path).write_bytes(audio_bytes)
+            return f"Speech generated and saved to {output_path}"
+        return "No audio content generated."
+    except Exception as e:
+        return f"Error generating speech: {e}"
+
+
+
+
 def create_chat(
     client: genai.Client,
     model_name: str,
@@ -315,29 +393,30 @@ def get_session(
     """Get or create a session, migrating history when switching models."""
     target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
 
-    if session_id not in sessions:
-        sessions[session_id] = create_chat(client, target_model, config=config)
+    with sessions_lock:
+        if session_id not in sessions:
+            sessions[session_id] = create_chat(client, target_model, config=config)
+            sessions[session_id]._gpal_model = target_model
+            return sessions[session_id]
+
+        session = sessions[session_id]
+        current_model = getattr(session, "_gpal_model", None)
+
+        if current_model == target_model:
+            return session
+
+        # Migrate history to new model
+        logging.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
+        try:
+            # Try _curated_history first (google-genai internal), fall back to .history
+            history = getattr(session, "_curated_history", getattr(session, "history", []))
+            sessions[session_id] = create_chat(client, target_model, history=history, config=config)
+        except Exception as e:
+            logging.error(f"History migration failed: {e}")
+            sessions[session_id] = create_chat(client, target_model, config=config)
+
         sessions[session_id]._gpal_model = target_model
         return sessions[session_id]
-
-    session = sessions[session_id]
-    current_model = getattr(session, "_gpal_model", None)
-
-    if current_model == target_model:
-        return session
-
-    # Migrate history to new model
-    logging.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
-    try:
-        # Try _curated_history first (google-genai internal), fall back to .history
-        history = getattr(session, "_curated_history", getattr(session, "history", []))
-        sessions[session_id] = create_chat(client, target_model, history=history, config=config)
-    except Exception as e:
-        logging.error(f"History migration failed: {e}")
-        sessions[session_id] = create_chat(client, target_model, config=config)
-
-    sessions[session_id]._gpal_model = target_model
-    return sessions[session_id]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
