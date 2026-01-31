@@ -228,12 +228,42 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
 # Client & Session Management
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Default key file locations (checked in order)
+DEFAULT_KEY_FILES = [
+    Path.home() / ".config" / "gpal" / "api_key",
+    Path.home() / ".gemini-api-key",
+]
+
+
+def _load_api_key() -> str | None:
+    """Load API key from environment or key file."""
+    # 1. Check environment variables (highest priority)
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if api_key:
+        return api_key
+
+    # 2. Check key files
+    for key_file in DEFAULT_KEY_FILES:
+        if key_file.exists():
+            try:
+                api_key = key_file.read_text().strip()
+                if api_key:
+                    logging.info(f"Loaded API key from {key_file}")
+                    return api_key
+            except OSError as e:
+                logging.warning(f"Could not read {key_file}: {e}")
+
+    return None
+
 
 def get_client() -> genai.Client:
-    """Create a Gemini API client from environment variables."""
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    """Create a Gemini API client from environment or key file."""
+    api_key = _load_api_key()
     if not api_key:
-        raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY not set.")
+        raise ValueError(
+            "Gemini API key not found. Set GEMINI_API_KEY environment variable "
+            f"or create {DEFAULT_KEY_FILES[0]}"
+        )
     return genai.Client(api_key=api_key)
 
 
