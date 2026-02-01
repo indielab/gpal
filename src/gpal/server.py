@@ -65,7 +65,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024    # 10 MB - prevents accidental DOS
 MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
 MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
-MAX_TOOL_CALLS = 10
+MAX_TOOL_CALLS = 1000
 MAX_SEARCH_RESULTS = 10
 
 # Retry configuration (tenacity handles all backoff)
@@ -673,7 +673,31 @@ def _consult(
 @GEMINI_RETRY_DECORATOR
 def _send_with_retry(session: Any, parts: list[types.Part], config: types.GenerateContentConfig) -> str:
     """Send message with automatic retry on transient errors."""
-    return session.send_message(parts, config=config).text
+    response = session.send_message(parts, config=config)
+    if response.text:
+        return response.text
+
+    # Handle cases where no text was generated (e.g., max tool calls, safety block)
+    candidate = response.candidates[0] if response.candidates else None
+    
+    # finish_reason might be an enum or int, try to get a string representation
+    finish_reason = getattr(candidate, "finish_reason", "UNKNOWN")
+    if hasattr(finish_reason, "name"):
+        finish_reason = finish_reason.name
+    
+    details = []
+    if candidate and candidate.content and candidate.content.parts:
+        for part in candidate.content.parts:
+            if hasattr(part, "function_call") and part.function_call:
+                details.append(f"[Function Call: {part.function_call.name}]")
+            elif hasattr(part, "function_response") and part.function_response:
+                details.append(f"[Function Result: {part.function_response.name}]")
+            elif hasattr(part, "executable_code") and part.executable_code:
+                details.append("[Code Execution]")
+            elif hasattr(part, "code_execution_result") and part.code_execution_result:
+                details.append("[Code Result]")
+
+    return f"System: No text generated. Finish Reason: {finish_reason}. Partial content: {', '.join(details)}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
