@@ -65,7 +65,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024    # 10 MB - prevents accidental DOS
 MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
 MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
-MAX_TOOL_CALLS = 1000
+RESPONSE_MAX_TOOL_CALLS = 25
 MAX_SEARCH_RESULTS = 10
 
 # Retry configuration (tenacity handles all backoff)
@@ -167,7 +167,7 @@ def get_server_info() -> str:
             "max_inline_media_mb": MAX_INLINE_MEDIA // (1024 * 1024),
             "max_search_files": MAX_SEARCH_FILES,
             "max_search_matches": MAX_SEARCH_MATCHES,
-            "max_tool_calls": MAX_TOOL_CALLS,
+            "max_tool_calls": RESPONSE_MAX_TOOL_CALLS,
             "session_ttl_seconds": 3600,
             "max_sessions": 100,
         },
@@ -428,7 +428,7 @@ def create_chat(
             tools=[list_directory, read_file, search_project],
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=False,
-                maximum_remote_calls=MAX_TOOL_CALLS,
+                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
             ),
             system_instruction=SYSTEM_INSTRUCTION,
         )
@@ -582,7 +582,7 @@ def _consult(
         "tools": [list_directory, read_file, search_project],
         "automatic_function_calling": types.AutomaticFunctionCallingConfig(
             disable=False,
-            maximum_remote_calls=MAX_TOOL_CALLS,
+            maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
         ),
         "system_instruction": SYSTEM_INSTRUCTION,
     }

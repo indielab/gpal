@@ -95,7 +95,8 @@ We always prefer the latest and most capable models available from Google.
 | `MAX_INLINE_MEDIA` | 20 MB | Caps inline media size (use upload_file for larger) |
 | `MAX_SEARCH_FILES` | 1000 | Caps glob expansion |
 | `MAX_SEARCH_MATCHES` | 20 | Truncates search results |
-| `MAX_TOOL_CALLS` | 10 | Limits autonomous tool use per response |
+| `MAX_SEARCH_RESULTS` | 10 | Limits web search results |
+| `RESPONSE_MAX_TOOL_CALLS` | 25 | Limits autonomous tool calls per response |
 
 ### Semantic Search Index (index.py)
 
