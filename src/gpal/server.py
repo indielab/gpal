@@ -856,6 +856,10 @@ async def consult_gemini_flash(
     """
     Consults Gemini 3 Flash (Fast/Efficient) for codebase exploration.
 
+    Use Flash only for quick exploration tasks (listing files, searching, navigating)
+    or when the user explicitly requests it. For code review, analysis, synthesis,
+    and all other tasks, use consult_gemini_pro instead — Pro is the default.
+
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
