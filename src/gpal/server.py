@@ -437,15 +437,28 @@ DEFAULT_KEY_FILES = [
     Path.home() / ".gemini-api-key",
 ]
 
+# Set by --api-key-file CLI arg; checked first by _load_api_key()
+_cli_key_file: Path | None = None
+
 
 def _load_api_key() -> str | None:
     """Load API key from environment or key file."""
-    # 1. Check environment variables (highest priority)
+    # 1. Check CLI-provided key file (highest priority)
+    if _cli_key_file is not None:
+        try:
+            api_key = _cli_key_file.read_text().strip()
+            if api_key:
+                logging.info(f"Loaded API key from {_cli_key_file} (--api-key-file)")
+                return api_key
+        except OSError as e:
+            logging.warning(f"Could not read --api-key-file {_cli_key_file}: {e}")
+
+    # 2. Check environment variables
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if api_key:
         return api_key
 
-    # 2. Check key files
+    # 3. Check default key files
     for key_file in DEFAULT_KEY_FILES:
         if key_file.exists():
             try:
@@ -1218,9 +1231,18 @@ def setup_otel(endpoint: str | None = None) -> None:
     propagate.set_global_textmap(TraceContextTextMapPropagator())
 
 def main() -> None:
+    global _cli_key_file
     parser = argparse.ArgumentParser(description="gpal - Gemini Principal Assistant Layer")
     parser.add_argument("--otel-endpoint", help="OTLP gRPC endpoint (e.g., localhost:4317)")
+    parser.add_argument(
+        "--api-key-file",
+        type=Path,
+        help="Path to file containing the Gemini API key",
+    )
     args, _ = parser.parse_known_args()
+
+    if args.api_key_file:
+        _cli_key_file = args.api_key_file
 
     setup_otel(args.otel_endpoint)
     mcp.run()
