@@ -21,40 +21,60 @@ When you ask gpal a question, Gemini doesn't just guess — it **explores your c
 
 | Feature | Description |
 |---------|-------------|
-| **Stateful sessions** | Maintains conversation history via `session_id` |
+| **Stateful sessions** | Maintains conversation history via `ctx.session_id` |
 | **Autonomous exploration** | Gemini has tools to list, read, and search files |
 | **Semantic search** | Find code by meaning using Gemini embeddings + chromadb |
-| **2M token context** | Leverages Gemini 3's massive context window |
-| **Two-tier consultation** | Flash for speed, Pro for depth |
-| **Seamless switching** | History preserved when switching between Flash and Pro |
+| **Gemini 3 Series** | Supports Flash, Pro, and **Deep Think** modes |
+| **Context Caching** | Store large code contexts to reduce costs and latency |
+| **Observability** | Native OpenTelemetry support (OTLP gRPC) |
+| **Distributed Tracing** | Propagates `traceparent` from MCP requests |
 | **Multimodal** | Analyze images, audio, video, PDFs |
-| **File uploads** | Upload large files to Gemini's File API |
-| **Structured output** | JSON mode with optional schema constraints |
-| **Nested agency** | Claude can delegate entire tasks to Gemini |
+| **Background Tasks** | Long-running operations (like indexing) don't block |
 
 **Limits:** 10MB file reads, 20MB inline media, 20 search matches max.
 
-### Flash vs Pro
+### Model Tiers
 
-| Model | Use Case | Strengths |
-|-------|----------|-----------|
-| `consult_gemini_flash` | **Scout** — exploration first | Fast, efficient, great for searching and mapping |
-| `consult_gemini_pro` | **Architect** — analysis second | Deep reasoning, synthesis, complex reviews |
+| Tool | Model Alias | Use Case |
+|-------|-------------|----------|
+| `consult_gemini_flash` | `flash` | **Scout** — Fast, efficient mapping and searching |
+| `consult_gemini_pro` | `pro` | **Architect** | Deep reasoning, complex reviews |
+| `consult_gemini_deep_think` | `deep-think` | **Specialist** | Extremely complex reasoning / chain-of-thought |
 
-**Workflow:** Start with Flash to gather context, then switch to Pro for analysis. Both share the same session history.
+**Workflow:** Start with Flash to gather context, then switch to Pro or Deep Think for analysis. History is preserved across all tiers.
+
+### Observability & Tracing
+
+gpal supports native OpenTelemetry for monitoring and distributed tracing. It automatically propagates `traceparent` headers from incoming MCP requests.
+
+```bash
+# Configure via standard environment variables
+export OTEL_SERVICE_NAME="gpal-server"
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
+
+# Or via CLI argument
+uv run gpal --otel-endpoint localhost:4317
+```
+
+### Context Caching
+
+Reduce costs for large projects by caching context on Google's servers:
+
+1.  Upload large files using `upload_file`.
+2.  Create a cache using `create_context_cache` with the returned URIs.
+3.  Reference the cache name in `consult_*` calls via the `cached_content` parameter.
+4.  View active caches via the `gpal://caches` resource.
 
 ### Semantic Search
 
 Find code by meaning, not just keywords:
 
 ```python
-# First, build the index (run once per project, or after major changes)
+# First, build the index (runs as a background task)
 rebuild_index("/path/to/project")
 
 # Then search by concept
-semantic_search("authentication logic")      # finds verify_jwt_token()
-semantic_search("error handling patterns")   # finds try/catch blocks
-semantic_search("database connection setup") # finds pool initialization
+semantic_search("authentication logic")
 ```
 
 - Uses Gemini's `text-embedding-004` model + chromadb for vector search
@@ -115,8 +135,7 @@ uv run pytest -v           # Verbose output
 
 ## Known Limitations / TODO
 
-- **Semantic search is MCP-only**: `semantic_search` and `rebuild_index` are available to MCP clients (Claude, Cursor) but not to Gemini's internal autonomous tools. Adding chromadb-based functions to Gemini's tool list causes mysterious failures (likely google-genai + chromadb compatibility issue). Investigate later.
-- **Thread safety**: The global index cache (`_indexes`) and `rebuild()` vs `search()` operations are not thread-safe. Concurrent rebuilds during search may cause empty results. Acceptable for single-user MCP usage.
+- **Semantic search is MCP-only**: `semantic_search` and `rebuild_index` are available to MCP clients (Claude, Cursor) but not to Gemini's internal autonomous tools. Adding chromadb-based functions to Gemini's tool list causes mysterious failures (likely google-genai + chromadb compatibility issue).
 - **Serial indexing**: `rebuild_index()` processes files sequentially. For large codebases this is slow. Future: parallelize with `ThreadPoolExecutor`.
 - **Nested .gitignore**: Only reads root `.gitignore`, ignores nested ones (common in monorepos).
 
@@ -127,3 +146,8 @@ uv run pytest -v           # Verbose output
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+## Roadmap / TODO
+
+- **Refactoring Agent:** A loop that edits files, runs tests (via `code_execution` or shell), and iterates until green.
+- **Review Agent:** specialized system instruction for code review that outputs structured comments.
