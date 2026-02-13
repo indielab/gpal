@@ -7,7 +7,9 @@ autonomous codebase exploration capabilities.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -36,6 +38,15 @@ from tenacity import (
     wait_exponential,
 )
 
+# OpenTelemetry imports
+from opentelemetry import trace, propagate
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
 load_dotenv()
 
 # Configure logging
@@ -50,8 +61,9 @@ logging.basicConfig(
 # Model versions (centralized for easy updates)
 MODEL_FLASH = "gemini-3-flash-preview"
 MODEL_PRO = "gemini-3-pro-preview"
-MODEL_SEARCH = "gemini-2.0-flash"        # Search/code exec use stable 2.0
-MODEL_CODE_EXEC = "gemini-2.0-flash"
+MODEL_DEEP_THINK = "gemini-3-pro-deep-think"  # New Gemini 3 Deep Think mode
+MODEL_SEARCH = "gemini-2.0-flash-001"        # Stable 2.0
+MODEL_CODE_EXEC = "gemini-2.0-flash-001"
 MODEL_IMAGE = "imagen-4.0-generate-001"
 MODEL_IMAGE_PRO = "gemini-3-pro-image-preview"    # Nano Banana Pro
 MODEL_IMAGE_FLASH = "gemini-2.5-flash-image"       # Nano Banana Flash
@@ -60,6 +72,7 @@ MODEL_SPEECH = "gemini-2.5-flash-preview-tts"
 MODEL_ALIASES: dict[str, str] = {
     "flash": MODEL_FLASH,
     "pro": MODEL_PRO,
+    "deep-think": MODEL_DEEP_THINK,
     "imagen": MODEL_IMAGE,
     "nano-pro": MODEL_IMAGE_PRO,
     "nano-flash": MODEL_IMAGE_FLASH,
@@ -162,10 +175,10 @@ modules when needed to gather complete context.
 # ─────────────────────────────────────────────────────────────────────────────
 
 mcp = FastMCP("gpal")
-sessions: TTLCache = TTLCache(maxsize=100, ttl=3600)  # 1 hour TTL
+sessions: TTLCache = TTLCache(maxsize=100, ttl=3600)  # Stores (session, lock)
 sessions_lock = threading.Lock()
-session_locks: dict[str, threading.Lock] = {}
-uploaded_files: TTLCache = TTLCache(maxsize=200, ttl=3600)  # 1 hour TTL, matches sessions
+# Note: session_locks dict is removed; locks are now bundled with sessions.
+uploaded_files: TTLCache = TTLCache(maxsize=200, ttl=3600)  # 1 hour TTL
 uploaded_files_lock = threading.Lock()
 _indexes: dict = {}  # Cache for semantic search indexes
 _indexes_lock = threading.Lock()  # Thread safety for _indexes
@@ -186,6 +199,7 @@ def get_server_info() -> str:
         "models": {
             "flash": MODEL_FLASH,
             "pro": MODEL_PRO,
+            "deep_think": MODEL_DEEP_THINK,
             "search": MODEL_SEARCH,
             "code_exec": MODEL_CODE_EXEC,
             "image": MODEL_IMAGE,
@@ -210,14 +224,8 @@ def get_server_info() -> str:
 def list_sessions_resource() -> str:
     """List active session IDs with model and history count."""
     with sessions_lock:
-        # Clean up stale locks for expired sessions
-        active_ids = set(sessions.keys())
-        stale_locks = [sid for sid in session_locks if sid not in active_ids]
-        for sid in stale_locks:
-            del session_locks[sid]
-
         session_list = []
-        for session_id, session in sessions.items():
+        for session_id, (session, _) in sessions.items():
             model = getattr(session, "_gpal_model", "unknown")
             # Try _curated_history first, fall back to history
             history = getattr(session, "_curated_history", getattr(session, "history", []))
@@ -233,20 +241,14 @@ def list_sessions_resource() -> str:
 @mcp.resource("gpal://session/{session_id}")
 def get_session_detail(session_id: str) -> str:
     """View conversation history for a session."""
-    # Acquire global lock briefly to check existence and get per-session lock
     with sessions_lock:
-        if session_id not in sessions:
-            return json.dumps({"error": f"Session '{session_id}' not found"})
-        if session_id not in session_locks:
-            session_locks[session_id] = threading.Lock()
-        lock = session_locks[session_id]
+        item = sessions.get(session_id)
+        if not item:
+            return json.dumps({"error": f"Session '{session_id}' not found or expired"})
+        session, lock = item
 
-    # Hold per-session lock while reading history (prevents racing with send_message)
+    # Hold per-session lock while reading history
     with lock:
-        session = sessions.get(session_id)
-        if not session:
-            return json.dumps({"error": f"Session '{session_id}' expired"})
-
         model = getattr(session, "_gpal_model", "unknown")
         history = getattr(session, "_curated_history", getattr(session, "history", []))
 
@@ -316,6 +318,25 @@ def get_index_stats() -> str:
 
     return json.dumps(stats, indent=2)
 
+
+@mcp.resource("gpal://caches")
+def list_context_caches_resource() -> str:
+    """List active Gemini context caches."""
+    client = get_client()
+    caches = []
+    try:
+        for cache in client.caches.list():
+            caches.append({
+                "name": cache.name,
+                "display_name": cache.display_name,
+                "model": cache.model,
+                "expire_time": str(cache.expire_time),
+                "tokens": getattr(cache.usage_metadata, "total_token_count", 0) if cache.usage_metadata else 0,
+            })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps(caches, indent=2)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Codebase Exploration Tools (Local)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -328,13 +349,16 @@ def list_directory(path: str = ".") -> list[str]:
         cwd = Path.cwd().resolve()
         
         if not p.is_relative_to(cwd):
-            return [f"Error: Access denied to '{path}' (outside project root)."]
+            logging.warning(f"Access denied to '{path}' (outside project root)")
+            return []
             
         if not p.exists():
-            return [f"Error: Path '{path}' does not exist."]
+            logging.warning(f"Path '{path}' does not exist")
+            return []
         return [item.name for item in p.iterdir()]
     except Exception as e:
-        return [f"Error listing directory: {e}"]
+        logging.error(f"Error listing directory: {e}")
+        return []
 
 
 def read_file(path: str) -> str:
@@ -364,27 +388,23 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
     try:
         cwd = Path.cwd().resolve()
 
-        # Basic validation to prevent obvious traversal
-        if ".." in glob_pattern:
-            return "Error: Glob pattern cannot contain '..'"
-
         # Use iglob iterator to avoid loading huge file lists into memory
         matches = []
         files_checked = 0
 
         for filepath in globlib.iglob(glob_pattern, recursive=True):
+            path_obj = Path(filepath).resolve()
+
+            # Ensure file is within project root and is a file
+            if not path_obj.is_relative_to(cwd) or not path_obj.is_file():
+                continue
+
             files_checked += 1
             if files_checked > MAX_SEARCH_FILES:
                 return (
                     f"Error: Too many files match '{glob_pattern}' (>{MAX_SEARCH_FILES}). "
                     "Use a more specific pattern, or try semantic_search for large codebases."
                 )
-
-            path_obj = Path(filepath).resolve()
-
-            # Ensure file is within project root
-            if not path_obj.is_relative_to(cwd) or not path_obj.is_file():
-                continue
 
             try:
                 with open(filepath, encoding="utf-8", errors="ignore") as f:
@@ -450,9 +470,18 @@ def get_index(root: str = "."):
     from gpal.index import CodebaseIndex  # lazy import
     root_path = Path(root).resolve()
     key = str(root_path)
+    
+    with _indexes_lock:
+        if key in _indexes:
+            return _indexes[key]
+    
+    # Create outside global lock to avoid blocking other project lookups
+    # Only one thread will win the assignment race below
+    new_index = CodebaseIndex(root_path, get_client())
+    
     with _indexes_lock:
         if key not in _indexes:
-            _indexes[key] = CodebaseIndex(root_path, get_client())
+            _indexes[key] = new_index
         return _indexes[key]
 
 def create_chat(
@@ -479,56 +508,46 @@ def create_chat(
         config=config,
     )
 
-def get_session(
-    session_id: str,
+async def get_session(
+    ctx: Context,
     client: genai.Client,
     model_alias: str,
     config: types.GenerateContentConfig | None = None,
-) -> Any:
-    """Get or create a session, migrating history when switching models."""
+) -> tuple[Any, threading.Lock]:
+    """Get or create a session, bundled with its own lock."""
+    session_id = ctx.session_id
     target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
 
     with sessions_lock:
-        if session_id not in sessions:
-            sessions[session_id] = create_chat(client, target_model, config=config)
-            sessions[session_id]._gpal_model = target_model
-            session_locks[session_id] = threading.Lock()
-            return sessions[session_id]
-        
-        # Ensure lock exists for existing session
-        if session_id not in session_locks:
-            session_locks[session_id] = threading.Lock()
+        if session_id in sessions:
+            session, lock = sessions[session_id]
+        else:
+            session = create_chat(client, target_model, config=config)
+            session._gpal_model = target_model
+            lock = threading.Lock()
+            sessions[session_id] = (session, lock)
+            await ctx.set_state("model", target_model)
+            return session, lock
 
-    # Use per-session lock for migration checks and updates
-    with session_locks[session_id]:
-        session = sessions[session_id]
+    # Use per-session lock for migration
+    with lock:
         current_model = getattr(session, "_gpal_model", None)
-
-        # Update config if provided (handles json_mode/schema switches)
-        if config:
-            # Note: This relies on the SDK exposing a way to update config, or we recreate the chat
-            # Since chat objects are stateful, we might need to recreate if config is fundamentally different
-            # For now, we'll recreate if JSON mode requirements change, or just set it on the next message
-            # The SDK's send_message accepts a config override, which we use in _consult.
-            # So the session object itself doesn't strictly need the new config permanently, 
-            # as long as we pass it to send_message.
-            pass
-
         if current_model == target_model:
-            return session
+            return session, lock
 
-        # Migrate history to new model
         logging.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
         try:
-            # Try _curated_history first (google-genai internal), fall back to .history
             history = getattr(session, "_curated_history", getattr(session, "history", []))
-            sessions[session_id] = create_chat(client, target_model, history=history, config=config)
+            session = create_chat(client, target_model, history=history, config=config)
         except Exception as e:
             logging.error(f"History migration failed: {e}")
-            sessions[session_id] = create_chat(client, target_model, config=config)
+            session = create_chat(client, target_model, config=config)
 
-        sessions[session_id]._gpal_model = target_model
-        return sessions[session_id]
+        session._gpal_model = target_model
+        with sessions_lock:
+            sessions[session_id] = (session, lock)
+        await ctx.set_state("model", target_model)
+        return session, lock
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -603,131 +622,143 @@ def _gemini_code_exec(
     return "Code executed (no output)."
 
 
-def _consult(
+async def _consult(
     query: str,
-    session_id: str,
+    ctx: Context,
     model_alias: str,
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
     file_uris: list[str] | None = None,
     json_mode: bool = False,
     response_schema: str | None = None,
+    cached_content: str | None = None,
 ) -> str:
     """Send a query to Gemini with codebase context."""
-    client = get_client()
+    headers = {}
+    if ctx.request_context and ctx.request_context.request:
+        # Use lowercase keys for OTel propagation compatibility
+        headers = {k.lower(): v for k, v in ctx.request_context.request.headers.items()}
+    
+    context = propagate.extract(headers)
+    tracer = trace.get_tracer("gpal")
 
-    # Build generation config
-    config_kwargs = {
-        "temperature": 0.2,
-        "tools": [list_directory, read_file, search_project],
-        "automatic_function_calling": types.AutomaticFunctionCallingConfig(
-            disable=False,
-            maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
-        ),
-        "system_instruction": SYSTEM_INSTRUCTION,
-    }
+    with tracer.start_as_current_span("consult", context=context) as span:
+        span.set_attribute("gpal.session_id", ctx.session_id)
+        span.set_attribute("gpal.model_alias", model_alias)
+        if cached_content:
+            span.set_attribute("gpal.cached_content", cached_content)
+        
+        client = get_client()
+        session_id = ctx.session_id
 
-    if json_mode:
-        config_kwargs["response_mime_type"] = "application/json"
-        if response_schema:
+        # Build generation config
+        config_kwargs = {
+            "temperature": 0.2,
+            "tools": [list_directory, read_file, search_project],
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=False,
+                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
+            ),
+            "system_instruction": SYSTEM_INSTRUCTION,
+        }
+
+        if json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
+            if response_schema:
+                try:
+                    config_kwargs["response_schema"] = json.loads(response_schema)
+                except json.JSONDecodeError as e:
+                    return f"Error: Invalid JSON schema: {e}"
+        
+        if cached_content:
+            config_kwargs["cached_content"] = cached_content
+
+        gen_config = types.GenerateContentConfig(**config_kwargs)
+
+        session, lock = await get_session(ctx, client, model_alias, gen_config)
+
+        parts: list[types.Part] = []
+        # ... (rest of parts construction remains the same)
+        # Context: Text files
+        for path in file_paths or []:
             try:
-                config_kwargs["response_schema"] = json.loads(response_schema)
-            except json.JSONDecodeError as e:
-                return f"Error: Invalid JSON schema: {e}"
+                content = Path(path).read_text(encoding="utf-8")
+                parts.append(types.Part.from_text(
+                    text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
+                ))
+            except Exception as e:
+                return f"Error reading file '{path}': {e}"
 
-    gen_config = types.GenerateContentConfig(**config_kwargs)
-
-    session = get_session(session_id, client, model_alias, gen_config)
-
-    parts: list[types.Part] = []
-
-    # Context: Text files
-    for path in file_paths or []:
-        try:
-            content = Path(path).read_text(encoding="utf-8")
-            parts.append(types.Part.from_text(
-                text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
-            ))
-        except Exception as e:
-            return f"Error reading file '{path}': {e}"
-
-    # Context: Inline media
-    for path in media_paths or []:
-        try:
-            p = Path(path)
-            if p.stat().st_size > MAX_INLINE_MEDIA:
-                return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit."
-            mime_type = detect_mime_type(path)
-            if not mime_type:
-                return f"Error: Unknown media type for '{path}'."
-            parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime_type))
-        except Exception as e:
-            return f"Error reading media '{path}': {e}"
-
-    # Context: File URIs (from upload_file or Gemini Files API)
-    for uri in file_uris or []:
-        mime = None
-        # Check local cache first (populated by upload_file)
-        with uploaded_files_lock:
-            cached = uploaded_files.get(uri)
-        if cached and cached.mime_type:
-            mime = cached.mime_type
-        else:
-            # Try the Files API for URIs not in our cache
+        # Context: Inline media
+        for path in media_paths or []:
             try:
-                # Extract file name from URI: .../files/<id>
-                # client.files.get requires resource name "files/<id>"
-                file_id = uri.rstrip("/").rsplit("/", 1)[-1]
-                file_meta = client.files.get(name=f"files/{file_id}")
-                mime = file_meta.mime_type
-            except Exception:
-                pass  # Fall through — let the SDK try without mime_type
-        parts.append(types.Part.from_uri(file_uri=uri, mime_type=mime))
+                p = Path(path)
+                if p.stat().st_size > MAX_INLINE_MEDIA:
+                    return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit."
+                mime_type = detect_mime_type(path)
+                if not mime_type:
+                    return f"Error: Unknown media type for '{path}'."
+                parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime_type))
+            except Exception as e:
+                return f"Error reading media '{path}': {e}"
 
-    parts.append(types.Part.from_text(text=query))
+        # Context: File URIs (from upload_file or Gemini Files API)
+        for uri in file_uris or []:
+            mime = None
+            # Check local cache first (populated by upload_file)
+            with uploaded_files_lock:
+                cached = uploaded_files.get(uri)
+            if cached and cached.mime_type:
+                mime = cached.mime_type
+            else:
+                # Try the Files API for URIs not in our cache
+                try:
+                    file_id = uri.rstrip("/").rsplit("/", 1)[-1]
+                    file_meta = client.files.get(name=f"files/{file_id}")
+                    mime = file_meta.mime_type
+                except Exception:
+                    pass
+            parts.append(types.Part.from_uri(file_uri=uri, mime_type=mime))
 
-    # Get the per-session lock for thread-safe send_message
-    with sessions_lock:
-        if session_id not in session_locks:
-            session_locks[session_id] = threading.Lock()
-        lock = session_locks[session_id]
+        parts.append(types.Part.from_text(text=query))
 
-    # Hold lock during send to prevent concurrent access to same session
-    replacement = None
-    with lock:
-        try:
-            return _send_with_retry(session, parts, gen_config)
-        except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-            return f"Error: Service temporarily unavailable after retries: {e}"
-        except Exception as e:
-            error_msg = str(e).lower()
-            # Detect stale client (httpx: "client is closed", grpc: "client has been closed")
-            if "client" not in error_msg or ("closed" not in error_msg and "shutdown" not in error_msg):
-                return f"Error: {e}"
+        # Offload the blocking Gemini API call to a thread pool
+        loop = asyncio.get_running_loop()
 
-            logging.warning(f"Session '{session_id}' has stale client, recreating...")
-            prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
-            prev_model = getattr(session, "_gpal_model", model_alias)
-
+        # Hold lock during send to prevent concurrent access to same session
+        replacement = None
+        with lock:
             try:
-                new_client = get_client()
-                target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
-                replacement = create_chat(new_client, target_model, history=prev_history, config=gen_config)
-                replacement._gpal_model = prev_model
-            except Exception as retry_e:
-                return f"Error after retry: {retry_e}"
+                func = partial(_send_with_retry, session, parts, gen_config)
+                return await loop.run_in_executor(None, func)
+            except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
+                return f"Error: Service temporarily unavailable after retries: {e}"
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "client" not in error_msg or ("closed" not in error_msg and "shutdown" not in error_msg):
+                    return f"Error: {e}"
 
-    # Update session cache outside per-session lock to maintain lock hierarchy
-    # (global lock is always acquired before per-session lock)
-    with sessions_lock:
-        sessions[session_id] = replacement
-        session_locks[session_id] = lock  # Ensure our lock stays registered
-    with lock:
-        try:
-            return _send_with_retry(replacement, parts, gen_config)
-        except Exception as retry_e:
-            return f"Error after retry: {retry_e}"
+                logging.warning(f"Session '{session_id}' has stale client, recreating...")
+                prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
+                prev_model = getattr(session, "_gpal_model", model_alias)
 
+                try:
+                    new_client = get_client()
+                    target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+                    replacement = create_chat(new_client, target_model, history=prev_history, config=gen_config)
+                    replacement._gpal_model = prev_model
+                except Exception as retry_e:
+                    return f"Error after retry: {retry_e}"
+
+        if replacement:
+            with sessions_lock:
+                sessions[session_id] = (replacement, lock)
+            with lock:
+                try:
+                    func = partial(_send_with_retry, replacement, parts, gen_config)
+                    return await loop.run_in_executor(None, func)
+                except Exception as retry_e:
+                    return f"Error after retry: {retry_e}"
 
 @GEMINI_RETRY_DECORATOR
 def _send_with_retry(session: Any, parts: list[types.Part], config: types.GenerateContentConfig) -> str:
@@ -796,12 +827,12 @@ def gemini_code_exec(
 @mcp.tool()
 async def consult_gemini_flash(
     query: str,
-    session_id: str = "default",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
     file_uris: list[str] | None = None,
     json_mode: bool = False,
     response_schema: str | None = None,
+    cached_content: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     """
@@ -810,32 +841,23 @@ async def consult_gemini_flash(
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        await ctx.debug(f"Flash query: session={session_id}, files={len(file_paths or [])}")
+        await ctx.debug(f"Flash query: session={ctx.session_id}, files={len(file_paths or [])}")
 
-    # Offload blocking Gemini API call to thread pool
-    loop = asyncio.get_running_loop()
-    func = partial(
-        _consult,
-        query, session_id, "flash", file_paths,
-        media_paths, file_uris, json_mode, response_schema
+    return await _consult(
+        query, ctx, "flash", file_paths,
+        media_paths, file_uris, json_mode, response_schema, cached_content
     )
-    result = await loop.run_in_executor(None, func)
-
-    if ctx:
-        await ctx.debug("Flash response received")
-
-    return result
 
 
 @mcp.tool()
 async def consult_gemini_pro(
     query: str,
-    session_id: str = "default",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
     file_uris: list[str] | None = None,
     json_mode: bool = False,
     response_schema: str | None = None,
+    cached_content: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     """
@@ -844,21 +866,37 @@ async def consult_gemini_pro(
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        await ctx.debug(f"Pro query: session={session_id}, files={len(file_paths or [])}")
+        await ctx.debug(f"Pro query: session={ctx.session_id}, files={len(file_paths or [])}")
 
-    # Offload blocking Gemini API call to thread pool
-    loop = asyncio.get_running_loop()
-    func = partial(
-        _consult,
-        query, session_id, "pro", file_paths,
-        media_paths, file_uris, json_mode, response_schema
+    return await _consult(
+        query, ctx, "pro", file_paths,
+        media_paths, file_uris, json_mode, response_schema, cached_content
     )
-    result = await loop.run_in_executor(None, func)
 
+
+@mcp.tool()
+async def consult_gemini_deep_think(
+    query: str,
+    file_paths: list[str] | None = None,
+    media_paths: list[str] | None = None,
+    file_uris: list[str] | None = None,
+    json_mode: bool = False,
+    response_schema: str | None = None,
+    cached_content: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """
+    Consults Gemini 3 in Deep Think mode for extremely complex reasoning.
+
+    Gemini has autonomous access to: list_directory, read_file, search_project.
+    """
     if ctx:
-        await ctx.debug("Pro response received")
+        await ctx.debug(f"Deep Think query: session={ctx.session_id}, files={len(file_paths or [])}")
 
-    return result
+    return await _consult(
+        query, ctx, "deep-think", file_paths,
+        media_paths, file_uris, json_mode, response_schema, cached_content
+    )
 
 
 @mcp.tool()
@@ -880,6 +918,54 @@ def upload_file(file_path: str, display_name: str | None = None) -> str:
 
 
 @mcp.tool()
+def create_context_cache(
+    file_uris: list[str],
+    model: str = "flash",
+    display_name: str | None = None,
+    ttl_seconds: int = 3600,
+) -> str:
+    """
+    Create a Gemini context cache for a set of files.
+    
+    Caching is useful for large files (>32k tokens) used across multiple turns.
+    Model must be an explicit version (e.g., gemini-1.5-flash-001) or a supported alias.
+    """
+    client = get_client()
+    resolved_model = MODEL_ALIASES.get(model.lower(), model)
+    
+    # Caching requires stable versioned IDs, not short preview aliases
+    if resolved_model in ["gemini-3-flash-preview", "gemini-2.0-flash-001"]:
+        resolved_model = "gemini-1.5-flash-001"
+    elif resolved_model in ["gemini-3-pro-preview", "gemini-3-pro-deep-think"]:
+        resolved_model = "gemini-1.5-pro-001"
+
+    try:
+        contents = [types.Part.from_uri(file_uri=uri) for uri in file_uris]
+        cache = client.caches.create(
+            model=resolved_model,
+            config=types.CreateCachedContentConfig(
+                display_name=display_name or f"Cache {datetime.datetime.now().isoformat()}",
+                contents=contents,
+                ttl=f"{ttl_seconds}s",
+            ),
+        )
+        return f"Cache created: {cache.name} (expires in {ttl_seconds}s)"
+    except Exception as e:
+        return f"Error creating cache: {e}"
+
+
+@mcp.tool()
+def delete_context_cache(cache_name: str) -> str:
+    """Delete a Gemini context cache."""
+    client = get_client()
+    try:
+        client.caches.delete(name=cache_name)
+        return f"Cache '{cache_name}' deleted."
+    except Exception as e:
+        return f"Error deleting cache: {e}"
+
+
+@mcp.tool()
 def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
     """Find code semantically related to the query using vector embeddings."""
     try:
@@ -895,7 +981,7 @@ def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
         return f"Error: {e}"
 
 
-@mcp.tool()
+@mcp.tool(task=True)
 async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
     """Rebuild the semantic search index for a codebase."""
     try:
@@ -1073,7 +1159,36 @@ def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> st
     except Exception as e:
         return f"Error: {e}"
 
+def setup_otel(endpoint: str | None = None) -> None:
+    """Configure OpenTelemetry for OTLP export using standard variables."""
+    # Priority: 1. CLI Arg, 2. GPAL specific ENV, 3. Standard OTel ENV
+    if not endpoint:
+        endpoint = os.getenv("GPAL_OTEL_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    
+    if not endpoint:
+        return
+
+    # Standard OTel service name
+    service_name = os.getenv("OTEL_SERVICE_NAME", "gpal")
+
+    logging.info(f"Configuring OpenTelemetry OTLP export for '{service_name}' to {endpoint}")
+    resource = Resource(attributes={"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+    
+    # Insecure for local/internal development as requested
+    processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True))
+    provider.add_span_processor(processor)
+    trace.set_tracer_provider(provider)
+    
+    # Enable W3C Trace Context propagation
+    propagate.set_global_textmap(TraceContextTextMapPropagator())
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="gpal - Gemini Principal Assistant Layer")
+    parser.add_argument("--otel-endpoint", help="OTLP gRPC endpoint (e.g., localhost:4317)")
+    args, _ = parser.parse_known_args()
+
+    setup_otel(args.otel_endpoint)
     mcp.run()
 
 if __name__ == "__main__":
