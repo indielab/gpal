@@ -344,23 +344,26 @@ def list_context_caches_resource() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def list_directory(path: str = ".") -> list[str]:
+def list_directory(path: str = ".") -> list[str] | str:
     """List files and directories at the given path."""
     try:
         p = Path(path).resolve()
         cwd = Path.cwd().resolve()
         
         if not p.is_relative_to(cwd):
-            logging.warning(f"Access denied to '{path}' (outside project root)")
-            return []
+            msg = f"Error: Access denied to '{path}' (outside project root)"
+            logging.warning(msg)
+            return msg
             
         if not p.exists():
-            logging.warning(f"Path '{path}' does not exist")
-            return []
+            msg = f"Error: Path '{path}' does not exist"
+            logging.warning(msg)
+            return msg
         return [item.name for item in p.iterdir()]
     except Exception as e:
-        logging.error(f"Error listing directory: {e}")
-        return []
+        msg = f"Error listing directory: {e}"
+        logging.error(msg)
+        return msg
 
 
 def read_file(path: str) -> str:
@@ -1057,7 +1060,9 @@ def _generate_image_imagen(
     )
     if response.generated_images:
         return response.generated_images[0].image.image_bytes
-    raise ValueError("Imagen returned no images")
+    
+    # Check for filtered content or other reasons
+    raise ValueError(f"Imagen returned no images. Response: {response}")
 
 
 def _generate_image_nano_banana(
@@ -1088,7 +1093,14 @@ def _generate_image_nano_banana(
         for part in response.candidates[0].content.parts:
             if part.inline_data and part.inline_data.mime_type.startswith("image/"):
                 return part.inline_data.data
-    raise ValueError("Nano Banana returned no image data")
+        
+        # If we got candidates but no image part
+        finish_reason = getattr(response.candidates[0], "finish_reason", "UNKNOWN")
+        if hasattr(finish_reason, "name"):
+            finish_reason = finish_reason.name
+        raise ValueError(f"Nano Banana returned no image data. Finish reason: {finish_reason}")
+        
+    raise ValueError("Nano Banana returned no candidates (possible safety filter)")
 
 
 NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH}
@@ -1169,7 +1181,15 @@ def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> st
 
             Path(output_path).write_bytes(audio_bytes)
             return f"Speech generated and saved to {output_path}"
-        return "No audio content generated."
+        
+        # Handle cases where no audio was generated (e.g. safety block)
+        finish_reason = "UNKNOWN"
+        if response.candidates:
+            finish_reason = getattr(response.candidates[0], "finish_reason", "UNKNOWN")
+            if hasattr(finish_reason, "name"):
+                finish_reason = finish_reason.name
+        
+        return f"Error: No audio content generated. Finish reason: {finish_reason}"
     except Exception as e:
         return f"Error: {e}"
 
