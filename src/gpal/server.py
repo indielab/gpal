@@ -63,7 +63,6 @@ logging.basicConfig(
 # Model versions (centralized for easy updates)
 MODEL_FLASH = "gemini-3-flash-preview"
 MODEL_PRO = "gemini-3-pro-preview"
-MODEL_DEEP_THINK = "gemini-3-pro-deep-think"  # New Gemini 3 Deep Think mode
 MODEL_SEARCH = "gemini-2.0-flash-001"        # Stable 2.0
 MODEL_CODE_EXEC = "gemini-2.0-flash-001"
 MODEL_IMAGE = "imagen-4.0-generate-001"
@@ -74,7 +73,6 @@ MODEL_SPEECH = "gemini-2.5-flash-preview-tts"
 MODEL_ALIASES: dict[str, str] = {
     "flash": MODEL_FLASH,
     "pro": MODEL_PRO,
-    "deep-think": MODEL_DEEP_THINK,
     "imagen": MODEL_IMAGE,
     "nano-pro": MODEL_IMAGE_PRO,
     "nano-flash": MODEL_IMAGE_FLASH,
@@ -201,7 +199,6 @@ def get_server_info() -> str:
         "models": {
             "flash": MODEL_FLASH,
             "pro": MODEL_PRO,
-            "deep_think": MODEL_DEEP_THINK,
             "search": MODEL_SEARCH,
             "code_exec": MODEL_CODE_EXEC,
             "image": MODEL_IMAGE,
@@ -863,7 +860,7 @@ async def consult_gemini_flash(
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        ctx.debug(f"Flash query: session={ctx.session_id}, files={len(file_paths or [])}")
+        await ctx.debug(f"Flash query: session={ctx.session_id}, files={len(file_paths or [])}")
 
     return await _consult(
         query, ctx, "flash", file_paths,
@@ -888,35 +885,10 @@ async def consult_gemini_pro(
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        ctx.debug(f"Pro query: session={ctx.session_id}, files={len(file_paths or [])}")
+        await ctx.debug(f"Pro query: session={ctx.session_id}, files={len(file_paths or [])}")
 
     return await _consult(
         query, ctx, "pro", file_paths,
-        media_paths, file_uris, json_mode, response_schema, cached_content
-    )
-
-
-@mcp.tool()
-async def consult_gemini_deep_think(
-    query: str,
-    file_paths: list[str] | None = None,
-    media_paths: list[str] | None = None,
-    file_uris: list[str] | None = None,
-    json_mode: bool = False,
-    response_schema: str | None = None,
-    cached_content: str | None = None,
-    ctx: Context | None = None,
-) -> str:
-    """
-    Consults Gemini 3 in Deep Think mode for extremely complex reasoning.
-
-    Gemini has autonomous access to: list_directory, read_file, search_project.
-    """
-    if ctx:
-        ctx.debug(f"Deep Think query: session={ctx.session_id}, files={len(file_paths or [])}")
-
-    return await _consult(
-        query, ctx, "deep-think", file_paths,
         media_paths, file_uris, json_mode, response_schema, cached_content
     )
 
@@ -958,7 +930,7 @@ def create_context_cache(
     # Caching requires stable versioned IDs, not short preview aliases
     if resolved_model in ["gemini-3-flash-preview", "gemini-2.0-flash-001"]:
         resolved_model = "gemini-1.5-flash-001"
-    elif resolved_model in ["gemini-3-pro-preview", "gemini-3-pro-deep-think"]:
+    elif resolved_model in ["gemini-3-pro-preview"]:
         resolved_model = "gemini-1.5-pro-001"
 
     try:
@@ -1008,26 +980,26 @@ async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
     """Rebuild the semantic search index for a codebase."""
     try:
         if ctx:
-            ctx.info(f"Rebuilding semantic index for {path}")
+            await ctx.info(f"Rebuilding semantic index for {path}")
 
         index = get_index(path)
 
         # Create progress callback that uses MCP Context
         async def progress_callback(message: str, current: int = 0, total: int = 0) -> None:
             if ctx:
-                ctx.info(f"[Index] {message}")
+                await ctx.info(f"[Index] {message}")
                 if total > 0:
-                    ctx.report_progress(progress=current, total=total)
+                    await ctx.report_progress(progress=current, total=total)
 
         result = await index.rebuild_async(progress_callback=progress_callback)
 
         if ctx:
-            ctx.info(f"Index complete: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} skipped")
+            await ctx.info(f"Index complete: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} skipped")
 
         return f"Index rebuilt: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} unchanged."
     except Exception as e:
         if ctx:
-            ctx.error(f"Index rebuild failed: {e}")
+            await ctx.error(f"Index rebuild failed: {e}")
         return f"Error: {e}"
 
 
