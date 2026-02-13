@@ -186,7 +186,7 @@ result = index.rebuild(
 uv sync --all-extras
 
 # Unit tests (no API key needed)
-uv run pytest tests/test_tools.py tests/test_index.py -v
+uv run pytest tests/test_server.py tests/test_tools.py tests/test_index.py -v
 
 # Manual integration tests (requires GEMINI_API_KEY)
 # ⚠️ These make live API calls and will incur Gemini API costs!
