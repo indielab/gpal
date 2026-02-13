@@ -5,8 +5,6 @@ An MCP server providing stateful access to Google Gemini models with
 autonomous codebase exploration capabilities.
 """
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import datetime
@@ -166,8 +164,12 @@ You are a consultant AI accessed via the Model Context Protocol (MCP).
 Your role is to provide high-agency, deep reasoning and analysis on tasks,
 usually in git repositories.
 
-You have tools: list_directory, read_file, and search_project.
-Use them proactively to explore the codebase—don't guess when you can verify.
+You have tools:
+- list_directory, read_file, search_project — explore the local codebase
+- gemini_search — search the web via Google Search
+- semantic_search — find code by meaning using vector embeddings
+
+Use them proactively to explore and verify—don't guess when you can look it up.
 
 You have a massive context window (2M tokens). Read entire files or multiple
 modules when needed to gather complete context.
@@ -693,7 +695,7 @@ async def _consult(
         # Build generation config
         config_kwargs = {
             "temperature": 0.2,
-            "tools": [list_directory, read_file, search_project],
+            "tools": [list_directory, read_file, search_project, gemini_search, semantic_search],
             "automatic_function_calling": types.AutomaticFunctionCallingConfig(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
@@ -845,7 +847,6 @@ def _send_with_retry(session: Any, parts: list[types.Part], config: types.Genera
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
 def gemini_search(
     query: str,
     num_results: int = 5,
@@ -858,6 +859,8 @@ def gemini_search(
     Stateless utility.
     """
     return _gemini_search(query, num_results, model)
+
+mcp.tool(gemini_search)
 
 
 @mcp.tool()
@@ -994,7 +997,6 @@ def delete_context_cache(cache_name: str) -> str:
         return f"Error deleting cache: {e}"
 
 
-@mcp.tool()
 def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
     """Find code semantically related to the query using vector embeddings."""
     try:
@@ -1008,6 +1010,8 @@ def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
         return "\n".join(output)
     except Exception as e:
         return f"Error: {e}"
+
+mcp.tool(semantic_search)
 
 
 @mcp.tool(timeout=300)
