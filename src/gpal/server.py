@@ -344,6 +344,23 @@ def list_context_caches_resource() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _validate_output_path(path: str) -> str | None:
+    """Validate that an output path is within the project root.
+
+    Returns None if valid, or an error message string if not.
+    The parent directory is created if it doesn't exist.
+    """
+    try:
+        p = Path(path).resolve()
+        cwd = Path.cwd().resolve()
+        if not p.is_relative_to(cwd):
+            return f"Error: Access denied — '{path}' is outside the project root."
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return None
+    except Exception as e:
+        return f"Error validating output path '{path}': {e}"
+
+
 def list_directory(path: str = ".") -> list[str] | str:
     """List files and directories at the given path."""
     try:
@@ -1130,11 +1147,12 @@ def generate_image(
         aspect_ratio: Aspect ratio (e.g. "1:1", "16:9", "9:16", "4:3", "3:4").
         image_size: Output size for Nano Banana only (e.g. "1024x1024"). Not supported by Imagen.
     """
+    err = _validate_output_path(output_path)
+    if err:
+        return err
     client = get_client()
     resolved = MODEL_ALIASES.get(model.lower(), model)
     try:
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
         if resolved in NANO_BANANA_MODELS:
             image_bytes = _generate_image_nano_banana(client, resolved, prompt, aspect_ratio, image_size)
         else:
@@ -1151,9 +1169,11 @@ def generate_image(
 @mcp.tool()
 def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> str:
     """Synthesizes speech from text."""
+    err = _validate_output_path(output_path)
+    if err:
+        return err
     client = get_client()
     try:
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         response = client.models.generate_content(
             model=MODEL_SPEECH,
             contents=text,
