@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime
+import io
 import json
 import logging
 import os
 import threading
+import wave
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -1152,7 +1154,19 @@ def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> st
             for part in response.candidates[0].content.parts:
                 if part.inline_data and "audio" in part.inline_data.mime_type:
                     audio_bytes += part.inline_data.data
+        
         if audio_bytes:
+            # Gemini TTS returns raw PCM (16-bit, 24kHz, mono). 
+            # If saving as .wav, we must add the header.
+            if output_path.lower().endswith(".wav") and not audio_bytes.startswith(b"RIFF"):
+                with io.BytesIO() as wav_io:
+                    with wave.open(wav_io, "wb") as wav_file:
+                        wav_file.setnchannels(1)      # Mono
+                        wav_file.setsampwidth(2)     # 16-bit
+                        wav_file.setframerate(24000) # 24kHz
+                        wav_file.writeframes(audio_bytes)
+                    audio_bytes = wav_io.getvalue()
+
             Path(output_path).write_bytes(audio_bytes)
             return f"Speech generated and saved to {output_path}"
         return "No audio content generated."
