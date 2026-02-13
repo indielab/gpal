@@ -102,6 +102,29 @@ async tool functions. The 3.x upgrade was clean — only required dropping `task
 `ctx.debug/info/warning/error/report_progress` are **async** — must be `await`ed.
 `ctx.set_state/get_state` are **sync**.
 
+### FastMCP 3.0 Feature Adoption (v0.3.1)
+
+**Tool Timeouts** — `timeout=` on `@mcp.tool()` decorators. FastMCP uses `anyio.fail_after()`
+and converts `TimeoutError` to `McpError(-32000)`.
+
+| Tool | Timeout | Rationale |
+|------|---------|-----------|
+| `consult_gemini_flash` | 60s | Fast model, 1 min ceiling |
+| `consult_gemini_pro` | 600s | Deep reasoning with tool calls |
+| `rebuild_index` | 300s | Large index rebuilds |
+| All others | None | Quick sync operations |
+
+**Rich ToolResult** — `_consult` returns `ToolResult` (from `fastmcp.tools.tool`) on success
+instead of plain `str`. Provides `structured_content` (model ID) and `meta` (model, session_id,
+duration_ms) for client introspection. Error paths still return plain strings.
+
+**OTel Simplification** — Removed `opentelemetry-instrumentation-fastapi` (unused — no FastAPI
+app to instrument). Removed manual trace context extraction from request headers in `_consult`;
+FastMCP 3.0 handles distributed trace context automatically via `inject_trace_context`/
+`extract_trace_context`. Our child span (`gemini_call`) nests under FastMCP's automatic
+`tools/call` span. The `setup_otel()` function is kept — it configures the OTel SDK
+(TracerProvider + OTLP exporter) that makes FastMCP's built-in instrumentation actually export.
+
 ### Updating Google Models
 
 Tips for keeping model IDs current:

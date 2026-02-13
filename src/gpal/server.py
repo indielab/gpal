@@ -40,14 +40,17 @@ from tenacity import (
     wait_exponential,
 )
 
+import time
+
 # OpenTelemetry imports
 from opentelemetry import trace, propagate
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+from fastmcp.tools.tool import ToolResult
 
 load_dotenv()
 
@@ -647,24 +650,28 @@ async def _consult(
     json_mode: bool = False,
     response_schema: str | None = None,
     cached_content: str | None = None,
-) -> str:
+) -> str | ToolResult:
     """Send a query to Gemini with codebase context."""
-    headers = {}
-    if ctx.request_context and ctx.request_context.request:
-        # Use lowercase keys for OTel propagation compatibility
-        headers = {k.lower(): v for k, v in ctx.request_context.request.headers.items()}
-    
-    context = propagate.extract(headers)
+    t0 = time.monotonic()
     tracer = trace.get_tracer("gpal")
 
-    with tracer.start_as_current_span("consult", context=context) as span:
-        span.set_attribute("gpal.session_id", ctx.session_id)
+    with tracer.start_as_current_span("gemini_call") as span:
         span.set_attribute("gpal.model_alias", model_alias)
+        span.set_attribute("gpal.session_id", ctx.session_id)
         if cached_content:
             span.set_attribute("gpal.cached_content", cached_content)
         
         client = get_client()
         session_id = ctx.session_id
+
+        def _wrap(text: str) -> ToolResult:
+            resolved = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+            elapsed_ms = round((time.monotonic() - t0) * 1000)
+            return ToolResult(
+                content=text,
+                structured_content={"result": text, "model": resolved},
+                meta={"model": resolved, "session_id": session_id, "duration_ms": elapsed_ms},
+            )
 
         # Build generation config
         config_kwargs = {
@@ -693,27 +700,36 @@ async def _consult(
         session, lock = await get_session(ctx, client, model_alias, gen_config)
 
         parts: list[types.Part] = []
-        # ... (rest of parts construction remains the same)
-        # Context: Text files
+        loop = asyncio.get_running_loop()
+
+        # Context: Text files (offloaded to thread pool to avoid blocking event loop)
         for path in file_paths or []:
             try:
-                content = Path(path).read_text(encoding="utf-8")
+                p = Path(path)
+                size = await loop.run_in_executor(None, lambda p=p: p.stat().st_size)
+                if size > MAX_FILE_SIZE:
+                    return f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
+                content = await loop.run_in_executor(
+                    None, lambda p=p: p.read_text(encoding="utf-8")
+                )
                 parts.append(types.Part.from_text(
                     text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
                 ))
             except Exception as e:
                 return f"Error reading file '{path}': {e}"
 
-        # Context: Inline media
+        # Context: Inline media (offloaded to thread pool)
         for path in media_paths or []:
             try:
                 p = Path(path)
-                if p.stat().st_size > MAX_INLINE_MEDIA:
+                size = await loop.run_in_executor(None, lambda p=p: p.stat().st_size)
+                if size > MAX_INLINE_MEDIA:
                     return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit."
                 mime_type = detect_mime_type(path)
                 if not mime_type:
                     return f"Error: Unknown media type for '{path}'."
-                parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime_type))
+                data = await loop.run_in_executor(None, lambda p=p: p.read_bytes())
+                parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
             except Exception as e:
                 return f"Error reading media '{path}': {e}"
 
@@ -737,15 +753,13 @@ async def _consult(
 
         parts.append(types.Part.from_text(text=query))
 
-        # Offload the blocking Gemini API call to a thread pool
-        loop = asyncio.get_running_loop()
-
         # Hold lock during send to prevent concurrent access to same session
         replacement = None
         with lock:
             try:
                 func = partial(_send_with_retry, session, parts, gen_config)
-                return await loop.run_in_executor(None, func)
+                text = await loop.run_in_executor(None, func)
+                return _wrap(text)
             except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
                 return f"Error: Service temporarily unavailable after retries: {e}"
             except Exception as e:
@@ -771,7 +785,8 @@ async def _consult(
             with lock:
                 try:
                     func = partial(_send_with_retry, replacement, parts, gen_config)
-                    return await loop.run_in_executor(None, func)
+                    text = await loop.run_in_executor(None, func)
+                    return _wrap(text)
                 except Exception as retry_e:
                     return f"Error after retry: {retry_e}"
 
@@ -779,8 +794,11 @@ async def _consult(
 def _send_with_retry(session: Any, parts: list[types.Part], config: types.GenerateContentConfig) -> str:
     """Send message with automatic retry on transient errors."""
     response = session.send_message(parts, config=config)
-    if response.text:
-        return response.text
+    try:
+        if response.text:
+            return response.text
+    except ValueError:
+        pass  # No text parts — fall through to detailed diagnostics
 
     # Handle cases where no text was generated (e.g., max tool calls, safety block)
     candidate = response.candidates[0] if response.candidates else None
@@ -839,7 +857,7 @@ def gemini_code_exec(
     return _gemini_code_exec(code, model)
 
 
-@mcp.tool()
+@mcp.tool(timeout=60)
 async def consult_gemini_flash(
     query: str,
     file_paths: list[str] | None = None,
@@ -849,7 +867,7 @@ async def consult_gemini_flash(
     response_schema: str | None = None,
     cached_content: str | None = None,
     ctx: Context | None = None,
-) -> str:
+) -> str | ToolResult:
     """
     Consults Gemini 3 Flash (Fast/Efficient) for codebase exploration.
 
@@ -868,7 +886,7 @@ async def consult_gemini_flash(
     )
 
 
-@mcp.tool()
+@mcp.tool(timeout=600)
 async def consult_gemini_pro(
     query: str,
     file_paths: list[str] | None = None,
@@ -878,7 +896,7 @@ async def consult_gemini_pro(
     response_schema: str | None = None,
     cached_content: str | None = None,
     ctx: Context | None = None,
-) -> str:
+) -> str | ToolResult:
     """
     Consults Gemini 3 Pro (Reasoning/Deep) for deep codebase analysis.
 
@@ -975,7 +993,7 @@ def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
         return f"Error: {e}"
 
 
-@mcp.tool()
+@mcp.tool(timeout=300)
 async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
     """Rebuild the semantic search index for a codebase."""
     try:

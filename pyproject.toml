@@ -1,6 +1,6 @@
 [project]
 name = "gpal"
-version = "0.3.0"
+version = "0.3.1"
 description = "An MCP server providing stateful Gemini access with autonomous codebase exploration"
 readme = "README.md"
 license = "MIT"
@@ -25,7 +25,6 @@ dependencies = [
     "opentelemetry-api>=1.30.0",
     "opentelemetry-sdk>=1.30.0",
     "opentelemetry-exporter-otlp>=1.30.0",
-    "opentelemetry-instrumentation-fastapi>=0.51b0",
     "pathspec>=1.0.4",
     "python-dotenv>=1.2.1",
     "tenacity>=9.1.4",

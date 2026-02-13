@@ -21,9 +21,9 @@ def test_list_directory(tmp_path, monkeypatch):
 
 def test_list_directory_nonexistent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    results = list_directory("non_existent_subdir")
-    assert len(results) == 1
-    assert "does not exist" in results[0]
+    result = list_directory("non_existent_subdir")
+    assert isinstance(result, str)
+    assert "does not exist" in result
 
 def test_read_file(tmp_path, monkeypatch):
     test_file = tmp_path / "test.txt"
