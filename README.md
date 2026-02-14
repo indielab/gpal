@@ -101,11 +101,16 @@ system_prompts = [
 # include_default_prompt = true
 ```
 
-**CLI flags:**
+Paths support `~` and `$ENV_VAR` expansion, so you can use `$WORKSPACE/CLAUDE.md` etc.
+
+**CLI flags** (repeatable, concatenated in order):
 
 ```bash
 # Append additional prompt files
 uv run gpal --system-prompt /path/to/project-context.md
+
+# Multiple files
+uv run gpal --system-prompt ~/GEMINI.md --system-prompt ./CLAUDE.md
 
 # Replace the built-in prompt entirely
 uv run gpal --system-prompt ~/my-prompt.md --no-default-prompt
