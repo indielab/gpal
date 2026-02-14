@@ -30,3 +30,7 @@ google_accounts.json
 # Claude Code local settings
 .claude/settings.local.json
 CLAUDE.local.md
+
+# Animation artifacts
+frames/
+gpal-v0.4.1.mp4
