@@ -149,3 +149,22 @@ class TestBuildSystemInstruction:
         config = {"system_prompts": ["~/GEMINI.md"]}
         text, sources = _build_system_instruction(config)
         assert "Tilde expanded" in text
+
+    def test_envvar_expansion(self, tmp_path, monkeypatch):
+        """Environment variables in paths get expanded."""
+        monkeypatch.setenv("WORKSPACE", str(tmp_path))
+        prompt_file = tmp_path / "CLAUDE.md"
+        prompt_file.write_text("Workspace prompt")
+        config = {"system_prompts": ["$WORKSPACE/CLAUDE.md"]}
+        text, sources = _build_system_instruction(config)
+        assert "Workspace prompt" in text
+
+    def test_envvar_expansion_cli(self, tmp_path, monkeypatch):
+        """Environment variables work in CLI --system-prompt paths too."""
+        monkeypatch.setenv("PROJECT", str(tmp_path))
+        prompt_file = tmp_path / "context.md"
+        prompt_file.write_text("CLI envvar prompt")
+        text, sources = _build_system_instruction(
+            {}, cli_prompt_files=["$PROJECT/context.md"]
+        )
+        assert "CLI envvar prompt" in text

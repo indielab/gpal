@@ -236,7 +236,7 @@ def _build_system_instruction(
         logger.warning("Config 'system_prompts' must be a list, got %s", type(config_prompts).__name__)
         config_prompts = []
     for path_str in config_prompts:
-        expanded = Path(os.path.expanduser(path_str))
+        expanded = Path(os.path.expandvars(os.path.expanduser(path_str)))
         try:
             content = expanded.read_text(encoding="utf-8")
             parts.append(content.strip())
@@ -252,7 +252,7 @@ def _build_system_instruction(
 
     # 4. CLI --system-prompt files
     for path_str in cli_prompt_files or []:
-        expanded = Path(os.path.expanduser(path_str))
+        expanded = Path(os.path.expandvars(os.path.expanduser(path_str)))
         try:
             content = expanded.read_text(encoding="utf-8")
             parts.append(content.strip())
