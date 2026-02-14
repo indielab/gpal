@@ -214,3 +214,43 @@ These may break with library updates. A future version could wrap sessions in a 
 | `GOOGLE_API_KEY` | Yes* | Alternative name (same purpose) |
 
 *One of these must be set.
+
+## Configuration
+
+### CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `--otel-endpoint` | OTLP gRPC endpoint (e.g., `localhost:4317`) |
+| `--api-key-file PATH` | Path to file containing the Gemini API key |
+| `--system-prompt FILE` | Additional system prompt file (repeatable) |
+| `--no-default-prompt` | Exclude the built-in default system instruction |
+
+### Config File: `~/.config/gpal/config.toml`
+
+Uses `$XDG_CONFIG_HOME/gpal/config.toml` (falls back to `~/.config/gpal/config.toml`).
+Parsed with Python 3.12 stdlib `tomllib` — no extra dependency.
+
+```toml
+# System prompt files, loaded in order and concatenated
+system_prompts = [
+    "~/.config/gpal/GEMINI.md",
+]
+
+# Inline system prompt text (appended after files)
+# system_prompt = "常に日本語で回答してください (Always respond in Japanese)"
+
+# If true (default), prepend the built-in gpal system instruction.
+# Set to false to fully replace it with your own.
+# include_default_prompt = true
+```
+
+Paths support `~` and `$ENV_VAR` expansion.
+
+**Composition order:**
+1. Built-in `DEFAULT_SYSTEM_INSTRUCTION` (if `include_default_prompt` is true and `--no-default-prompt` not set)
+2. Files from `system_prompts` list (in order)
+3. Inline `system_prompt` from config.toml
+4. Files from `--system-prompt` CLI flags (in order)
+
+All joined with `\n\n`. Provenance visible in `gpal://info`.
