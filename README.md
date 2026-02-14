@@ -81,6 +81,44 @@ semantic_search("authentication logic")
 - Index stored at `~/.local/share/gpal/index/` (XDG compliant)
 - Respects `.gitignore`, skips binary/hidden files
 
+### Custom System Prompts
+
+Customize what Gemini "knows" about you, your project, or your workflow by composing system prompts from multiple sources.
+
+**Config file** (`~/.config/gpal/config.toml`):
+
+```toml
+# Files loaded in order and concatenated
+system_prompts = [
+    "~/.config/gpal/GEMINI.md",
+    "~/CLAUDE.md",
+]
+
+# Inline text appended after files
+# system_prompt = "Always respond in Japanese"
+
+# Set to false to fully replace the built-in prompt with your own
+# include_default_prompt = true
+```
+
+**CLI flags:**
+
+```bash
+# Append additional prompt files
+uv run gpal --system-prompt /path/to/project-context.md
+
+# Replace the built-in prompt entirely
+uv run gpal --system-prompt ~/my-prompt.md --no-default-prompt
+```
+
+**Composition order:**
+1. Built-in gpal system instruction (unless `include_default_prompt = false` or `--no-default-prompt`)
+2. Files from `system_prompts` in config.toml
+3. Inline `system_prompt` from config.toml
+4. Files from `--system-prompt` CLI flags
+
+Check what's active via the `gpal://info` resource — it shows which sources contributed and the total instruction length.
+
 ## Installation
 
 ### Prerequisites

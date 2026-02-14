@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import threading
+import tomllib
 import wave
 from functools import partial
 from pathlib import Path
@@ -161,7 +162,7 @@ def detect_mime_type(path: str) -> str | None:
     ext = Path(path).suffix.lower()
     return MIME_TYPES.get(ext)
 
-SYSTEM_INSTRUCTION = """
+DEFAULT_SYSTEM_INSTRUCTION = """
 You are a consultant AI accessed via the Model Context Protocol (MCP).
 Your role is to provide high-agency, deep reasoning and analysis on tasks,
 usually in git repositories.
@@ -176,6 +177,99 @@ Use them proactively to explore and verify—don't guess when you can look it up
 You have a massive context window (2M tokens). Read entire files or multiple
 modules when needed to gather complete context.
 """
+
+# Composed system instruction — set by main(), defaults to built-in
+_system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION
+_system_instruction_sources: list[str] = ["built-in"]
+
+logger = logging.getLogger("gpal")
+
+
+def _load_config() -> dict:
+    """Load config from $XDG_CONFIG_HOME/gpal/config.toml (or ~/.config/gpal/config.toml).
+
+    Returns parsed dict, or empty dict if file doesn't exist.
+    Logs a warning on parse errors (non-fatal).
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    config_path = Path(config_home) / "gpal" / "config.toml"
+
+    if not config_path.is_file():
+        logger.debug("No config file at %s", config_path)
+        return {}
+
+    try:
+        with open(config_path, "rb") as f:
+            config = tomllib.load(f)
+        logger.info("Loaded config from %s", config_path)
+        return config
+    except tomllib.TOMLDecodeError as e:
+        logger.warning("Invalid TOML in %s: %s", config_path, e)
+        return {}
+
+
+def _build_system_instruction(
+    config: dict,
+    cli_prompt_files: list[str] | None = None,
+    no_default: bool = False,
+) -> tuple[str, list[str]]:
+    """Compose the system instruction from config, files, and CLI flags.
+
+    Returns (instruction_text, list_of_sources) where sources describes
+    provenance for debugging.
+    """
+    parts: list[str] = []
+    sources: list[str] = []
+
+    # 1. Built-in default (unless suppressed)
+    include_default = config.get("include_default_prompt", True)
+    if no_default:
+        include_default = False
+
+    if include_default:
+        parts.append(DEFAULT_SYSTEM_INSTRUCTION.strip())
+        sources.append("built-in")
+
+    # 2. Files from config.toml system_prompts list
+    config_prompts = config.get("system_prompts", [])
+    if not isinstance(config_prompts, list):
+        logger.warning("Config 'system_prompts' must be a list, got %s", type(config_prompts).__name__)
+        config_prompts = []
+    for path_str in config_prompts:
+        expanded = Path(os.path.expanduser(path_str))
+        try:
+            content = expanded.read_text(encoding="utf-8")
+            parts.append(content.strip())
+            sources.append(str(expanded))
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("Error reading system prompt %s: %s", expanded, e)
+
+    # 3. Inline system_prompt from config.toml
+    inline = config.get("system_prompt")
+    if inline and isinstance(inline, str):
+        parts.append(inline.strip())
+        sources.append("config.toml (inline)")
+
+    # 4. CLI --system-prompt files
+    for path_str in cli_prompt_files or []:
+        expanded = Path(os.path.expanduser(path_str))
+        try:
+            content = expanded.read_text(encoding="utf-8")
+            parts.append(content.strip())
+            sources.append(f"--system-prompt {expanded}")
+        except FileNotFoundError:
+            logger.warning("CLI system prompt file not found: %s", expanded)
+        except OSError as e:
+            logger.warning("Error reading CLI system prompt %s: %s", expanded, e)
+
+    if not parts:
+        # Fallback: if everything was suppressed and no files provided,
+        # use the default anyway to avoid an empty instruction
+        parts.append(DEFAULT_SYSTEM_INSTRUCTION.strip())
+        sources.append("built-in (fallback)")
+
+    return "\n\n".join(parts), sources
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Server & State
@@ -222,6 +316,10 @@ def get_server_info() -> str:
             "max_tool_calls": RESPONSE_MAX_TOOL_CALLS,
             "session_ttl_seconds": 3600,
             "max_sessions": 100,
+        },
+        "system_instruction": {
+            "sources": _system_instruction_sources,
+            "length_chars": len(_system_instruction),
         },
     }
     return json.dumps(info, indent=2)
@@ -585,7 +683,7 @@ def create_chat(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
             ),
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=_system_instruction,
         )
 
     return client.chats.create(
@@ -749,7 +847,7 @@ async def _consult(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
             ),
-            "system_instruction": SYSTEM_INSTRUCTION,
+            "system_instruction": _system_instruction,
         }
 
         if json_mode:
@@ -1298,7 +1396,7 @@ def setup_otel(endpoint: str | None = None) -> None:
     propagate.set_global_textmap(TraceContextTextMapPropagator())
 
 def main() -> None:
-    global _cli_key_file
+    global _cli_key_file, _system_instruction, _system_instruction_sources
     parser = argparse.ArgumentParser(description="gpal - Your Pal Gemini")
     parser.add_argument("--otel-endpoint", help="OTLP gRPC endpoint (e.g., localhost:4317)")
     parser.add_argument(
@@ -1306,10 +1404,31 @@ def main() -> None:
         type=Path,
         help="Path to file containing the Gemini API key",
     )
+    parser.add_argument(
+        "--system-prompt",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="Additional system prompt file (repeatable, appended after config)",
+    )
+    parser.add_argument(
+        "--no-default-prompt",
+        action="store_true",
+        help="Exclude the built-in default system instruction",
+    )
     args, _ = parser.parse_known_args()
 
     if args.api_key_file:
         _cli_key_file = args.api_key_file
+
+    # Load config and compose system instruction
+    config = _load_config()
+    _system_instruction, _system_instruction_sources = _build_system_instruction(
+        config,
+        cli_prompt_files=args.system_prompt,
+        no_default=args.no_default_prompt,
+    )
+    logger.info("System instruction sources: %s", _system_instruction_sources)
 
     setup_otel(args.otel_endpoint)
     mcp.run()
