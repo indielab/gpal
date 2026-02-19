@@ -19,12 +19,19 @@ from typing import Union
 import chromadb
 import pathspec
 from google import genai
-from google.api_core.exceptions import ResourceExhausted
+from google.api_core.exceptions import (
+    InternalServerError,
+    ResourceExhausted,
+    ServiceUnavailable,
+)
+import logging
+
 from tenacity import (
+    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    wait_exponential_jitter,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,7 +46,7 @@ EMBEDDING_BATCH_SIZE = 100  # Max chunks per Gemini API call
 
 # Rate limiting and retry configuration
 RATE_LIMIT_DELAY = 0.05  # 50ms between batches
-MAX_RETRIES = 3  # Max retry attempts on failure
+MAX_RETRIES = 5  # Max retry attempts on failure
 MAX_CONCURRENT_EMBEDS = 10  # Max concurrent embedding requests
 
 # Binary/generated file extensions to skip
@@ -297,8 +304,9 @@ class CodebaseIndex:
 
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=1, max=30),
-        retry=retry_if_exception_type(ResourceExhausted),
+        wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
+        retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, InternalServerError)),
+        before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
         reraise=True,
     )
     def _embed_batch(
@@ -351,8 +359,9 @@ class CodebaseIndex:
 
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=1, max=30),
-        retry=retry_if_exception_type(ResourceExhausted),
+        wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
+        retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, InternalServerError)),
+        before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
         reraise=True,
     )
     async def _embed_batch_async(
@@ -833,8 +842,13 @@ class CodebaseIndex:
             if progress_callback:
                 progress_callback(f"Indexing {rel_path}...")
 
-            self.index_file(path)
-            indexed += 1
+            try:
+                self.index_file(path)
+                indexed += 1
+            except Exception as e:
+                logging.warning(f"Failed to index {rel_path}: {e}")
+                if progress_callback:
+                    progress_callback(f"Error indexing {rel_path}: {e}")
 
         # Remove stale files (not in dry run)
         removed = self._remove_stale_files(current_files)

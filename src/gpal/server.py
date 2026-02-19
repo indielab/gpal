@@ -39,7 +39,7 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    wait_exponential_jitter,
 )
 
 import random
@@ -70,14 +70,15 @@ logging.basicConfig(
 
 # Model versions (centralized for easy updates)
 MODEL_FLASH = "gemini-3-flash-preview"
-MODEL_PRO = "gemini-3-pro-preview"
+MODEL_PRO = "gemini-3.1-pro-preview"
 MODEL_SEARCH = "gemini-flash-latest"          # Auto-updates to latest stable Flash
 MODEL_CODE_EXEC = "gemini-flash-latest"
 MODEL_IMAGE = "imagen-4.0-ultra-generate-001"
 MODEL_IMAGE_FAST = "imagen-4.0-fast-generate-001"
-MODEL_IMAGE_PRO = "nano-banana-pro-preview"        # Nano Banana Pro
+MODEL_IMAGE_PRO = "gemini-3-pro-image-preview"      # Gemini 3 Pro image generation
 MODEL_IMAGE_FLASH = "gemini-2.5-flash-image"       # Nano Banana Flash
 MODEL_SPEECH = "gemini-2.5-pro-preview-tts"
+MODEL_SPEECH_FAST = "gemini-2.5-flash-preview-tts"
 
 MODEL_ALIASES: dict[str, str] = {
     "flash": MODEL_FLASH,
@@ -87,6 +88,7 @@ MODEL_ALIASES: dict[str, str] = {
     "nano-pro": MODEL_IMAGE_PRO,
     "nano-flash": MODEL_IMAGE_FLASH,
     "speech": MODEL_SPEECH,
+    "speech-fast": MODEL_SPEECH_FAST,
 }
 
 # Limits
@@ -100,7 +102,7 @@ MAX_SEARCH_RESULTS = 10
 # Retry configuration (tenacity handles all backoff)
 GEMINI_RETRY_DECORATOR = retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, min=2, max=60),
+    wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
     retry=retry_if_exception_type(
         (ServiceUnavailable, ResourceExhausted, InternalServerError)
     ),
@@ -127,6 +129,7 @@ RATE_LIMITS_TPM: dict[str, int] = {
     MODEL_FLASH: 4_000_000,
     MODEL_SEARCH: 4_000_000,  # Resolves to a Flash model
     MODEL_SPEECH: 2_000_000,
+    MODEL_SPEECH_FAST: 4_000_000,
     MODEL_IMAGE_PRO: 1_000_000,
     MODEL_IMAGE_FLASH: 4_000_000,
 }
@@ -469,6 +472,7 @@ def get_server_info() -> str:
             "image_pro": MODEL_IMAGE_PRO,
             "image_flash": MODEL_IMAGE_FLASH,
             "speech": MODEL_SPEECH,
+            "speech_fast": MODEL_SPEECH_FAST,
         },
         "limits": {
             "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
@@ -623,6 +627,7 @@ def check_model_freshness() -> str:
         "image_pro": MODEL_IMAGE_PRO,
         "image_flash": MODEL_IMAGE_FLASH,
         "speech": MODEL_SPEECH,
+        "speech_fast": MODEL_SPEECH_FAST,
     }
 
     try:
@@ -1501,7 +1506,7 @@ def create_context_cache(
     # Caching requires stable versioned IDs, not short preview aliases
     if resolved_model in ["gemini-3-flash-preview", "gemini-2.0-flash-001"]:
         resolved_model = "gemini-1.5-flash-001"
-    elif resolved_model in ["gemini-3-pro-preview"]:
+    elif resolved_model in ["gemini-3-pro-preview", "gemini-3.1-pro-preview"]:
         resolved_model = "gemini-1.5-pro-001"
 
     try:
@@ -1677,7 +1682,7 @@ def _generate_image_nano_banana(
     raise ValueError("Nano Banana returned no candidates (possible safety filter)")
 
 
-NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH, "gemini-3-pro-image-preview"}
+NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH, "nano-banana-pro-preview"}
 
 
 @mcp.tool()
@@ -1717,16 +1722,17 @@ def generate_image(
 
 
 @mcp.tool()
-def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> str:
+def generate_speech(text: str, output_path: str, voice_name: str = "Puck", model: str = "speech") -> str:
     """Synthesizes speech from text."""
     err = _validate_output_path(output_path)
     if err:
         return err
-    _sync_throttle(MODEL_SPEECH)
+    resolved = MODEL_ALIASES.get(model.lower(), model)
+    _sync_throttle(resolved)
     client = get_client()
     try:
         response = client.models.generate_content(
-            model=MODEL_SPEECH,
+            model=resolved,
             contents=text,
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
@@ -1743,7 +1749,7 @@ def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> st
         usage = getattr(response, "usage_metadata", None)
         total = getattr(usage, "total_token_count", 0) or 0
         if total > 0:
-            record_tokens(MODEL_SPEECH, total)
+            record_tokens(resolved, total)
 
         audio_bytes = b""
         if response.candidates:
