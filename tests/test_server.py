@@ -19,6 +19,7 @@ from gpal.server import (
     record_tokens, tokens_in_window, token_stats, GeminiResponse,
     _sync_throttle, _async_throttle, _KNOWN_MODELS, MODEL_SEARCH,
     RATE_LIMITS_TPM, _afc_local, _send_with_retry, _EXECUTOR,
+    _extract_retry_delay, _is_retriable_genai_error,
 )
 
 
@@ -91,7 +92,7 @@ async def test_tool_input_schemas():
 
 EXPECTED_TIMEOUTS = {
     "consult_gemini": 660,
-    "consult_gemini_oneshot": 120,
+    "consult_gemini_oneshot": 600,
     "rebuild_index": 300,
 }
 
@@ -403,3 +404,84 @@ def test_executor_has_gpal_prefix():
     """_EXECUTOR threads use 'gpal' prefix."""
     assert _EXECUTOR._thread_name_prefix == "gpal"
     assert _EXECUTOR._max_workers == 16
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I. Retry Delay Extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_retry_delay_from_retry_info():
+    """Extracts retryDelay from google.rpc.RetryInfo in error details."""
+    from google.genai.errors import ClientError
+    exc = ClientError(429, {
+        "error": {
+            "code": 429,
+            "message": "Rate limited",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "18.5s"},
+            ],
+        }
+    })
+    delay = _extract_retry_delay(exc)
+    assert delay == pytest.approx(18.5)
+
+
+def test_extract_retry_delay_integer_seconds():
+    """Handles integer-style retryDelay like '18s'."""
+    from google.genai.errors import ClientError
+    exc = ClientError(429, {
+        "error": {
+            "code": 429,
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "18s"},
+            ],
+        }
+    })
+    assert _extract_retry_delay(exc) == 18.0
+
+
+def test_extract_retry_delay_no_retry_info():
+    """Returns None when no RetryInfo is present."""
+    from google.genai.errors import ClientError
+    exc = ClientError(429, {"error": {"code": 429, "details": []}})
+    assert _extract_retry_delay(exc) is None
+
+
+def test_extract_retry_delay_not_api_error():
+    """Returns None for non-APIError exceptions."""
+    assert _extract_retry_delay(RuntimeError("boom")) is None
+
+
+def test_extract_retry_delay_string_error():
+    """Handles error responses where 'error' is a string, not a dict."""
+    from google.genai.errors import ClientError
+    exc = ClientError(429, {"error": "Model overloaded"})
+    assert _extract_retry_delay(exc) is None
+
+
+def test_is_retriable_429():
+    """429 errors are retriable."""
+    from google.genai.errors import ClientError
+    exc = ClientError(429, {"error": {"code": 429}})
+    assert _is_retriable_genai_error(exc) is True
+
+
+def test_is_retriable_500():
+    """500 errors are retriable."""
+    from google.genai.errors import ServerError
+    exc = ServerError(500, {"error": {"code": 500}})
+    assert _is_retriable_genai_error(exc) is True
+
+
+def test_is_not_retriable_400():
+    """400 Bad Request is not retriable."""
+    from google.genai.errors import ClientError
+    exc = ClientError(400, {"error": {"code": 400}})
+    assert _is_retriable_genai_error(exc) is False
+
+
+def test_is_not_retriable_non_api_error():
+    """Non-APIError exceptions are not retriable."""
+    assert _is_retriable_genai_error(RuntimeError("boom")) is False

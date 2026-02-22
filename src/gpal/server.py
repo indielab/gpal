@@ -27,17 +27,12 @@ from cachetools import TTLCache
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from google import genai
-from google.api_core.exceptions import (
-    InternalServerError,
-    ResourceExhausted,
-    ServiceUnavailable,
-)
-from google.genai import types
+from google.genai import errors as genai_errors, types
 from google.genai.types import GoogleSearch, Tool, ToolCodeExecution
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential_jitter,
 )
@@ -99,13 +94,73 @@ MAX_SEARCH_MATCHES = 20
 RESPONSE_MAX_TOOL_CALLS = 25
 MAX_SEARCH_RESULTS = 10
 
+# Retriable HTTP status codes from the Gemini API
+_RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_retriable_genai_error(exc: BaseException) -> bool:
+    """Check if a genai exception is retriable based on HTTP status code."""
+    if isinstance(exc, genai_errors.APIError):
+        return getattr(exc, "code", None) in _RETRIABLE_STATUS_CODES
+    return False
+
+
+def _extract_retry_delay(exc: BaseException) -> float | None:
+    """Extract server-suggested retry delay from a Gemini API error.
+
+    Parses the RetryInfo from the error details, e.g.:
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "18s"}
+    """
+    if not isinstance(exc, genai_errors.APIError):
+        return None
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return None
+    # Navigate: top-level or nested under 'error' (guard against non-dict 'error' values)
+    error_obj = details.get("error", details)
+    if not isinstance(error_obj, dict):
+        return None
+    error_details = error_obj.get("details", [])
+    if not isinstance(error_details, list):
+        return None
+    for detail in error_details:
+        if not isinstance(detail, dict):
+            continue
+        if "RetryInfo" in detail.get("@type", ""):
+            delay_str = detail.get("retryDelay", "")
+            if isinstance(delay_str, str) and delay_str.endswith("s"):
+                try:
+                    return float(delay_str[:-1])
+                except ValueError:
+                    pass
+    return None
+
+
+def _wait_with_retry_delay(retry_state: Any) -> float:
+    """Tenacity wait function that honors server-suggested retry delay.
+
+    Falls back to exponential backoff with jitter when no RetryInfo is present.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if exc:
+        delay = _extract_retry_delay(exc)
+        if delay is not None and delay > 0:
+            # Add small jitter (0-2s) to avoid thundering herd
+            return delay + random.uniform(0, 2)
+    # Fallback: exponential backoff with jitter
+    return wait_exponential_jitter(initial=2, max=60, jitter=5)(retry_state)
+
+
+# Disable SDK-internal retry for calls wrapped by our decorator.
+# The SDK has its own 5-attempt tenacity retry that ignores RetryInfo.
+# We suppress it so our retry (which honors RetryInfo) handles everything.
+_NO_SDK_RETRY = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
+
 # Retry configuration (tenacity handles all backoff)
 GEMINI_RETRY_DECORATOR = retry(
     stop=stop_after_attempt(5),
-    wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
-    retry=retry_if_exception_type(
-        (ServiceUnavailable, ResourceExhausted, InternalServerError)
-    ),
+    wait=_wait_with_retry_delay,
+    retry=retry_if_exception(_is_retriable_genai_error),
     before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
     reraise=True,
 )
@@ -934,6 +989,7 @@ def _gemini_search(
             config=types.GenerateContentConfig(
                 tools=[Tool(google_search=GoogleSearch())],
                 temperature=0.1,
+                http_options=_NO_SDK_RETRY,
             ),
         )
 
@@ -973,6 +1029,7 @@ def _gemini_code_exec(
         config=types.GenerateContentConfig(
             tools=[Tool(code_execution=ToolCodeExecution())],
             temperature=0,
+            http_options=_NO_SDK_RETRY,
         ),
     )
 
@@ -1042,7 +1099,7 @@ async def _consult(
             )
 
         # Build generation config
-        config_kwargs = {
+        config_kwargs: dict[str, Any] = {
             "temperature": 0.2,
             "tools": [list_directory, read_file, search_project, gemini_search, semantic_search, git],
             "automatic_function_calling": types.AutomaticFunctionCallingConfig(
@@ -1050,6 +1107,7 @@ async def _consult(
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
             ),
             "system_instruction": _system_instruction,
+            "http_options": _NO_SDK_RETRY,
         }
 
         if json_mode:
@@ -1059,7 +1117,7 @@ async def _consult(
                     config_kwargs["response_schema"] = json.loads(response_schema)
                 except json.JSONDecodeError as e:
                     return f"Error: Invalid JSON schema: {e}"
-        
+
         if cached_content:
             config_kwargs["cached_content"] = cached_content
 
@@ -1132,8 +1190,10 @@ async def _consult(
                     func = partial(_send_with_retry, session, parts, gen_config)
                     resp = await loop.run_in_executor(_EXECUTOR, func)
                     return _wrap(resp)
-                except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-                    return f"Error: Service temporarily unavailable after retries: {e}"
+                except genai_errors.APIError as e:
+                    if _is_retriable_genai_error(e):
+                        return f"Error: Service temporarily unavailable after retries: {e}"
+                    return f"Error: {e}"
                 except Exception as e:
                     error_msg = str(e).lower()
                     is_stale = "client" in error_msg and ("closed" in error_msg or "shutdown" in error_msg)
@@ -1351,7 +1411,7 @@ async def consult_gemini(
     )
 
 
-@mcp.tool(timeout=120)
+@mcp.tool(timeout=600)
 async def consult_gemini_oneshot(
     query: str,
     model: str = "pro",
@@ -1428,6 +1488,7 @@ async def consult_gemini_oneshot(
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
             ),
             "system_instruction": _system_instruction,
+            "http_options": _NO_SDK_RETRY,
         }
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
@@ -1463,8 +1524,10 @@ async def consult_gemini_oneshot(
                     "total_tokens": resp.total_tokens,
                 },
             )
-        except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-            return f"Error: Service temporarily unavailable after retries: {e}"
+        except genai_errors.APIError as e:
+            if _is_retriable_genai_error(e):
+                return f"Error: Service temporarily unavailable after retries: {e}"
+            return f"Error: {e}"
         except Exception as e:
             return f"Error: {e}"
 

@@ -19,20 +19,26 @@ from typing import Union
 import chromadb
 import pathspec
 from google import genai
-from google.api_core.exceptions import (
-    InternalServerError,
-    ResourceExhausted,
-    ServiceUnavailable,
-)
+from google.genai import errors as genai_errors
 import logging
 
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential_jitter,
 )
+
+# Retriable HTTP status codes from the Gemini API
+_RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_retriable_genai_error(exc: BaseException) -> bool:
+    """Check if a genai exception is retriable based on HTTP status code."""
+    if isinstance(exc, genai_errors.APIError):
+        return getattr(exc, "code", None) in _RETRIABLE_STATUS_CODES
+    return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -305,7 +311,7 @@ class CodebaseIndex:
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
         wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
-        retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, InternalServerError)),
+        retry=retry_if_exception(_is_retriable_genai_error),
         before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
         reraise=True,
     )
@@ -360,7 +366,7 @@ class CodebaseIndex:
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
         wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
-        retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, InternalServerError)),
+        retry=retry_if_exception(_is_retriable_genai_error),
         before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
         reraise=True,
     )
