@@ -468,11 +468,12 @@ def test_is_retriable_429():
     assert _is_retriable_genai_error(exc) is True
 
 
-def test_is_retriable_500():
-    """500 errors are retriable."""
+def test_is_not_retriable_5xx():
+    """5xx errors are not retriable — surface immediately."""
     from google.genai.errors import ServerError
-    exc = ServerError(500, {"error": {"code": 500}})
-    assert _is_retriable_genai_error(exc) is True
+    for code in (500, 502, 503, 504):
+        exc = ServerError(code, {"error": {"code": code}})
+        assert _is_retriable_genai_error(exc) is False, f"{code} should not be retriable"
 
 
 def test_is_not_retriable_400():

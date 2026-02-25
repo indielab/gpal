@@ -97,7 +97,10 @@ RESPONSE_MAX_TOOL_CALLS = 25
 MAX_SEARCH_RESULTS = 10
 
 # Retriable HTTP status codes from the Gemini API
-_RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# Only retry 429 (rate limited) — it's the one case where waiting helps,
+# and often comes with RetryInfo. All 5xx = server-side problem, surface
+# immediately so the caller can decide whether/when to retry.
+_RETRIABLE_STATUS_CODES = {429}
 
 
 def _is_retriable_genai_error(exc: BaseException) -> bool:
