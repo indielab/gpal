@@ -5,4 +5,4 @@ An MCP server providing stateful access to Google Gemini models with
 autonomous codebase exploration capabilities.
 """
 
-__version__ = "0.7.3"
+__version__ = "0.8.5"

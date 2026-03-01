@@ -66,6 +66,7 @@ logging.basicConfig(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Model versions (centralized for easy updates)
+MODEL_LITE = "gemini-2.5-flash-lite"
 MODEL_FLASH = "gemini-3-flash-preview"
 MODEL_PRO = "gemini-3.1-pro-preview"
 MODEL_SEARCH = "gemini-flash-latest"          # Auto-updates to latest stable Flash
@@ -78,6 +79,7 @@ MODEL_SPEECH = "gemini-2.5-pro-preview-tts"
 MODEL_SPEECH_FAST = "gemini-2.5-flash-preview-tts"
 
 MODEL_ALIASES: dict[str, str] = {
+    "lite": MODEL_LITE,
     "flash": MODEL_FLASH,
     "pro": MODEL_PRO,
     "imagen": MODEL_IMAGE,
@@ -108,6 +110,26 @@ def _is_retriable_genai_error(exc: BaseException) -> bool:
     if isinstance(exc, genai_errors.APIError):
         return getattr(exc, "code", None) in _RETRIABLE_STATUS_CODES
     return False
+
+
+def _format_api_error(exc: genai_errors.APIError, model_alias: str) -> str:
+    """Format an API error into an actionable message for the MCP caller.
+
+    503 errors get special treatment — they're transient capacity issues
+    where the right move is to surface the problem and let the user decide.
+    """
+    code = getattr(exc, "code", None)
+    resolved = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+    if code == 503:
+        return (
+            f"Error: {resolved} is temporarily unavailable (503 — high demand). "
+            f"This is a transient Google-side capacity issue, not a bug. "
+            f"Demand spikes usually clear within a few minutes. "
+            f"Please wait briefly and retry the same call."
+        )
+    if _is_retriable_genai_error(exc):
+        return f"Error: Service temporarily unavailable after retries: {exc}"
+    return f"Error: {exc}"
 
 
 def _extract_retry_delay(exc: BaseException) -> float | None:
@@ -210,6 +232,7 @@ _afc_api_semaphore = threading.Semaphore(4)
 
 # Published TPM limits (tokens per minute) — conservative defaults
 RATE_LIMITS_TPM: dict[str, int] = {
+    MODEL_LITE: 4_000_000,
     MODEL_PRO: 1_000_000,
     MODEL_FLASH: 4_000_000,
     MODEL_SEARCH: 4_000_000,  # Resolves to a Flash model
@@ -370,26 +393,87 @@ def detect_mime_type(path: str) -> str | None:
     ext = Path(path).suffix.lower()
     return MIME_TYPES.get(ext)
 
-DEFAULT_SYSTEM_INSTRUCTION = """
-You are a consultant AI accessed via the Model Context Protocol (MCP).
-Your role is to provide high-agency, deep reasoning and analysis on tasks,
-usually in git repositories.
+# ── Role-specific system instructions ──────────────────────────────────────
+# Base identity shared by all roles. Role-specific variants append to this.
 
-You have tools:
+_SYSTEM_BASE = """\
+We are a cybernetic system — a human and AI models working together via \
+the Model Context Protocol (MCP). Our shared goal is holistic, high-agency \
+reasoning and analysis, usually in git repositories.
+
+We ground every claim in code we have actually read. When uncertain, we say \
+so — we never confabulate facts, function signatures, or behavior.\
+"""
+
+_SYSTEM_TOOL_LIST = """
+We have tools:
 - list_directory, read_file, search_project — explore the local codebase
 - git — read-only git operations (status, diff, log, show)
 - gemini_search — search the web via Google Search
 - semantic_search — find code by meaning using vector embeddings
 
-Use them proactively to explore and verify—don't guess when you can look it up.
-
-You have a massive context window (2M tokens). Read entire files or multiple
-modules when needed to gather complete context.
+We use them proactively to explore and verify — we don't guess when we can \
+look it up.\
 """
 
-# Composed system instruction — set by main(), defaults to built-in
-_system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION
-_system_instruction_sources: list[str] = ["built-in"]
+# Lite in auto mode — cheap, aggressive, thorough exploration
+_SYSTEM_EXPLORER = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+
+Our job in this phase is EXPLORATION. We load as much relevant context as \
+possible for a follow-up synthesis phase. The synthesis model has tools but \
+works best from context we've already loaded — our thoroughness here saves \
+it round-trips.
+
+Priorities:
+- Read files in full. Thoroughness is the priority — the more context we \
+load, the better the synthesis phase performs.
+- Include tests: read test files to understand coverage and test efficacy.
+- Start with a repo tree summary (list_directory at key levels) so the \
+synthesis phase understands the project layout.
+- Follow imports, call chains, and data flow across module boundaries.\
+"""
+
+# Pro synthesis — deep thinking with tools available to fill gaps
+_SYSTEM_THINKER = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+
+We are in the synthesis phase. An exploration agent has loaded extensive \
+codebase context into this conversation. We have tools available to fill \
+gaps, but most context is already present.
+
+We provide end-to-end analysis. In addition to answering the question directly:
+- Flag security concerns we actually see in the code (not hypothetical checklists).
+- Note technical debt, dead code, and unnecessary complexity.
+- Assess test coverage and test efficacy — are the tests actually testing \
+the right behavior? Do they catch real bugs or just exercise happy paths?
+- Be concrete: give exact file paths, line numbers, and code changes.\
+"""
+
+# Flash synthesis — frontier model with tools available to fill gaps
+_SYSTEM_ANALYST = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+
+We are in the synthesis phase. An exploration agent has loaded extensive \
+codebase context into this conversation. We have tools available to fill \
+gaps, but most context is already present.
+
+We bring creative insight, not just mechanical analysis. We identify patterns, \
+suggest improvements, and think beyond the literal question when it serves \
+our goals. We provide concrete, actionable answers with exact file paths \
+and code changes.\
+"""
+
+# Direct model calls (flash or pro with tools enabled)
+_SYSTEM_AGENT = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+
+We read entire files or multiple modules when needed to gather complete context.
+We flag real security concerns, technical debt, and test gaps when we spot them.\
+"""
+
+# Kept as the default for _build_system_instruction and backward compat
+DEFAULT_SYSTEM_INSTRUCTION = _SYSTEM_AGENT
+
+# Composed user instruction layers — set by main(), appended after role prompts
+_user_instruction: str = ""
+_user_instruction_sources: list[str] = []
 
 logger = logging.getLogger("gpal")
 
@@ -422,10 +506,11 @@ def _build_system_instruction(
     cli_prompt_files: list[str] | None = None,
     no_default: bool = False,
 ) -> tuple[str, list[str]]:
-    """Compose the system instruction from config, files, and CLI flags.
+    """Compose the user instruction layers from config, files, and CLI flags.
 
     Returns (instruction_text, list_of_sources) where sources describes
-    provenance for debugging.
+    provenance for debugging. The result is appended after the role-specific
+    system prompt (explorer/thinker/agent) at call time.
     """
     parts: list[str] = []
     sources: list[str] = []
@@ -436,8 +521,7 @@ def _build_system_instruction(
         include_default = False
 
     if include_default:
-        parts.append(DEFAULT_SYSTEM_INSTRUCTION.strip())
-        sources.append("built-in")
+        sources.append("built-in (role-specific)")
 
     # 2. Files from config.toml system_prompts list
     config_prompts = config.get("system_prompts", [])
@@ -471,13 +555,14 @@ def _build_system_instruction(
         except OSError as e:
             logger.warning("Error reading CLI system prompt %s: %s", expanded, e)
 
-    if not parts:
-        # Fallback: if everything was suppressed and no files provided,
-        # use the default anyway to avoid an empty instruction
-        parts.append(DEFAULT_SYSTEM_INSTRUCTION.strip())
-        sources.append("built-in (fallback)")
-
     return "\n\n".join(parts), sources
+
+
+def _compose_instruction(role_prompt: str) -> str:
+    """Combine a role-specific prompt with user instruction layers."""
+    if _user_instruction:
+        return role_prompt.strip() + "\n\n" + _user_instruction
+    return role_prompt.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -548,6 +633,7 @@ def get_server_info() -> str:
     info = {
         "version": __version__,
         "models": {
+            "lite": MODEL_LITE,
             "flash": MODEL_FLASH,
             "pro": MODEL_PRO,
             "search": MODEL_SEARCH,
@@ -569,8 +655,9 @@ def get_server_info() -> str:
             "max_sessions": 100,
         },
         "system_instruction": {
-            "sources": _system_instruction_sources,
-            "length_chars": len(_system_instruction),
+            "roles": ["explorer", "thinker", "analyst", "agent"],
+            "user_layers": _user_instruction_sources,
+            "agent_length_chars": len(_compose_instruction(_SYSTEM_AGENT)),
         },
         "token_usage": token_stats(),
     }
@@ -703,6 +790,7 @@ def check_model_freshness() -> str:
     any -latest aliases that have resolved to newer versions.
     """
     configured = {
+        "lite": MODEL_LITE,
         "flash": MODEL_FLASH,
         "pro": MODEL_PRO,
         "search": MODEL_SEARCH,
@@ -821,6 +909,9 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
     """
     if Path(glob_pattern).is_absolute():
         return "Error: Absolute glob patterns are not allowed. Use relative patterns."
+
+    if ".." in Path(glob_pattern).parts:
+        return "Error: Glob patterns cannot contain '..'."
 
     try:
         cwd = Path.cwd().resolve()
@@ -949,7 +1040,7 @@ def create_chat(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
             ),
-            system_instruction=_system_instruction,
+            system_instruction=_compose_instruction(_SYSTEM_AGENT),
         )
 
     return client.chats.create(
@@ -987,7 +1078,11 @@ async def get_session(
 
         logging.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
         try:
-            history = getattr(session, "_curated_history", getattr(session, "history", []))
+            history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
+            # Gemini API requires history to end with a model response;
+            # a failed prior call may leave a trailing user turn
+            if history and getattr(history[-1], "role", "") == "user":
+                history.pop()
             session = create_chat(client, target_model, history=history, config=config)
         except Exception as e:
             logging.error(f"History migration failed: {e}")
@@ -1108,7 +1203,7 @@ async def _consult(
     json_mode: bool = False,
     response_schema: str | None = None,
     cached_content: str | None = None,
-    tools_enabled: bool = True,
+    role: str = "agent",
 ) -> str | ToolResult:
     """Send a query to Gemini with codebase context."""
     t0 = time.monotonic()
@@ -1143,25 +1238,28 @@ async def _consult(
             )
 
         # Build generation config
-        # Always provide tools so history containing function calls remains valid
+        # Tools + AFC always enabled so history with function calls stays valid
+        # and synthesis models can fill gaps the explorer missed
+        _role_prompts = {
+            "explorer": _SYSTEM_EXPLORER,
+            "thinker": _SYSTEM_THINKER,
+            "analyst": _SYSTEM_ANALYST,
+            "agent": _SYSTEM_AGENT,
+        }
+        role_prompt = _role_prompts.get(role, _SYSTEM_AGENT)
         config_kwargs: dict[str, Any] = {
             "temperature": 0.2,
             "tools": [list_directory, read_file, search_project, gemini_search, semantic_search, git],
-            "system_instruction": _system_instruction,
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=False,
+                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
+            ),
+            "system_instruction": _compose_instruction(role_prompt),
             "http_options": _NO_SDK_RETRY,
         }
 
-        if tools_enabled:
-            config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
-                disable=False,
-                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
-            )
-        else:
-            # Tools stay in config for history validation, but AFC is disabled
-            # so Pro won't make autonomous tool calls
-            config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
-                disable=True,
-            )
+        # Enable deep thinking for Pro synthesis
+        if role == "thinker":
             config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="HIGH")
 
         if json_mode:
@@ -1258,9 +1356,7 @@ async def _consult(
                     resp = await loop.run_in_executor(_EXECUTOR, _run)
                     return _wrap(resp)
                 except genai_errors.APIError as e:
-                    if _is_retriable_genai_error(e):
-                        return f"Error: Service temporarily unavailable after retries: {e}"
-                    return f"Error: {e}"
+                    return _format_api_error(e, model_alias)
                 except Exception as e:
                     error_msg = str(e).lower()
                     is_stale = "client" in error_msg and ("closed" in error_msg or "shutdown" in error_msg)
@@ -1269,11 +1365,14 @@ async def _consult(
 
                     logging.warning(f"Session '{session_id}' has stale client, recreating...")
                     try:
-                        prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
+                        prev_history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
+                        # Sanitize: Gemini API requires history to end with model response
+                        if prev_history and getattr(prev_history[-1], "role", "") == "user":
+                            prev_history.pop()
                         new_client = get_client()
                         target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
                         session = create_chat(new_client, target_model, history=prev_history, config=gen_config)
-                        session._gpal_model = getattr(session, "_gpal_model", model_alias)
+                        session._gpal_model = target_model
                     except Exception as retry_e:
                         return f"Error recreating session: {retry_e}"
 
@@ -1359,66 +1458,67 @@ def gemini_code_exec(
     return _gemini_code_exec(code, model)
 
 
-_FLASH_EXPLORE_PROMPT = """\
-You are in exploration mode. Your goal is to load comprehensive codebase context for a \
-follow-up synthesis phase. The synthesis phase has NO tool access — every file you skip \
-is a file it can never see.
+_EXPLORE_PROMPT = """\
+We are in exploration mode. Our goal is to load comprehensive codebase context \
+for a follow-up synthesis phase. The synthesis model has tools but works best \
+from context we've already loaded — our thoroughness here saves it round-trips.
 
 TASK: {query}
 
 STRATEGY:
-- Start with `semantic_search` to find conceptual entry points.
-- Use `list_directory` and `search_project` for specific definitions and patterns.
-- **Always read files in full.** You have a massive context window — use it. Complete \
+- We start with `semantic_search` to find conceptual entry points.
+- We use `list_directory` and `search_project` for specific definitions and patterns.
+- **We always read files in full.** We have a massive context window. Complete \
 source files enable holistic observations that snippets miss.
-- Read related files too: tests, configs, type definitions, imports. Cast a wide net — \
-the synthesis phase cannot fill gaps.
-- Use reasoning to follow imports, call chains, and data flow — that's navigation, \
-not analysis. Follow the thread wherever it leads.
-- Use `git` to check recent changes, blame, or history when provenance matters.
+- We read related files too: tests, configs, type definitions, imports. We cast \
+a wide net — the more context we load, the better the synthesis phase performs.
+- We follow imports, call chains, and data flow — that's navigation, not analysis. \
+We follow the thread wherever it leads.
+- We use `git` to check recent changes, blame, or history when provenance matters.
 
-DO NOT:
-- Propose fixes, write code, or provide recommendations.
-- Stop until you have a clear picture of the task's "surface area."
+WE DO NOT:
+- Propose fixes, write code, or provide recommendations in this phase.
+- Stop until we have a clear picture of the task's "surface area."
 - Skip files to save tokens — thoroughness is the priority.
 
 OUTPUT — Structured Inventory:
 1. **Key Modules**: File paths with brief roles and important line numbers.
-2. **Data Flow**: How data moves through the components you found.
+2. **Data Flow**: How data moves through the components found.
 3. **Patterns & Constants**: Architectural patterns, config values, shared conventions.
-4. **Files Read in Full**: List every file you read completely (critical — the synthesis \
+4. **Files Read in Full**: List every file read completely (critical — the synthesis \
 phase relies on this context being present in the conversation).
 5. **Blind Spots**: Files referenced but not found, unclear ownership, anything unresolved.
 """
 
-_PRO_SYNTHESIS_PROMPT = """\
-You are in the SYNTHESIS phase. You have NO tool access — all relevant source code \
-has been loaded into the conversation by the exploration phase.
+_SYNTHESIS_PROMPT = """\
+We are in the SYNTHESIS phase. An exploration agent has loaded extensive codebase \
+context into this conversation. We have tools available to fill gaps, but most \
+context is already present.
 
 CONTEXT:
 The conversation history above contains complete file contents, search results, and \
-directory listings from a thorough exploration agent. You have full source files to \
-work with — leverage the complete context for holistic analysis.
+directory listings from a thorough exploration agent. We have full source files to \
+work with — let's leverage the complete context for holistic analysis.
 
 TASK: {query}
 
 APPROACH:
-1. **Analysis**: Using the loaded source code, explain *why* the code is structured \
-this way. Identify the specific logic relevant to the task.
-2. **Solution Design**: Propose a concrete, step-by-step plan.
-3. **Implementation**: Provide exact code changes with file paths. Include enough \
-surrounding context (or rewrite the full function) so changes can be applied unambiguously.
-4. **Gaps**: If the exploration missed something critical, note it as a limitation \
-rather than trying to fill the gap.
+1. **Analysis**: We use the loaded source code to explain *why* the code is \
+structured this way. We identify the specific logic relevant to the task.
+2. **Solution Design**: We propose a concrete, step-by-step plan.
+3. **Implementation**: We provide exact code changes with file paths, with enough \
+surrounding context (or full function rewrites) so changes can be applied unambiguously.
+4. **Gaps**: If the exploration missed something critical, we use our tools to fill \
+it rather than leaving it unresolved.
 
-GOAL: A complete, actionable response the user can apply immediately.
+GOAL: A complete, actionable response we can apply immediately.
 """
 
 
 @mcp.tool(timeout=660, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
 async def consult_gemini(
     query: Annotated[str, Field(description="The question or instruction")],
-    model: Annotated[str, Field(default="auto", description='"auto" (default, Flash explore → Pro analyze), "flash", "pro", or full model ID')] = "auto",
+    model: Annotated[str, Field(default="auto", description='"auto" (default, Lite explore → Flash analyze), "flash", "pro", "lite", or full model ID')] = "auto",
     file_paths: Annotated[list[str] | None, Field(default=None, description="Local text files to read and include inline as context")] = None,
     media_paths: Annotated[list[str] | None, Field(default=None, description="Local image/PDF files (.png, .jpg, .webp, .gif, .pdf) for vision analysis")] = None,
     file_uris: Annotated[list[str] | None, Field(default=None, description="Gemini File API URIs (from upload_file). Use for large files that exceed inline limits")] = None,
@@ -1433,42 +1533,48 @@ async def consult_gemini(
     if ctx:
         await ctx.debug(f"consult_gemini: model={model}, session={ctx.session_id}, files={len(file_paths or [])}")
 
+    # Determine synthesis model — all recognized aliases except "lite" get Lite explore first
     if model == "auto":
-        # Phase 1: Flash explores
-        if ctx:
-            await ctx.info("Phase 1: Flash exploration...")
-        explore_query = _FLASH_EXPLORE_PROMPT.format(query=query)
-        flash_result = await _consult(
-            explore_query, ctx, "flash", file_paths,
-            media_paths, file_uris, False, None, cached_content
-        )
-
-        # Extract text from ToolResult or string
-        if isinstance(flash_result, ToolResult):
-            flash_text = flash_result.content or ""
-        else:
-            flash_text = flash_result
-
-        # Check for errors in flash phase
-        if isinstance(flash_text, str) and flash_text.startswith("Error:"):
-            return flash_result
-
-        # Phase 2: Pro synthesizes (same session — history migrates automatically)
-        # Pro runs tool-free with thinking enabled — pure analysis over Flash's context
-        if ctx:
-            await ctx.info("Phase 2: Pro synthesis (thinking, AFC disabled)...")
-        synthesis_query = _PRO_SYNTHESIS_PROMPT.format(query=query)
+        synth_model = "flash"
+    elif model in ("flash", "pro"):
+        synth_model = model
+    elif model == "lite":
+        # Direct pass-through, no explore phase
         return await _consult(
-            synthesis_query, ctx, "pro", None,
-            None, None, json_mode, response_schema, None,
-            tools_enabled=False
+            query, ctx, "lite", file_paths,
+            media_paths, file_uris, json_mode, response_schema, cached_content
+        )
+    else:
+        # Full model ID → direct pass-through
+        return await _consult(
+            query, ctx, model, file_paths,
+            media_paths, file_uris, json_mode, response_schema, cached_content
         )
 
-    # Direct model pass-through
-    alias = model if model in MODEL_ALIASES else model
+    # Phase 1: Lite explores (aggressive tool use, loads full file contents)
+    if ctx:
+        await ctx.info("Phase 1: Lite exploration...")
+    explore_query = _EXPLORE_PROMPT.format(query=query)
+    explore_result = await _consult(
+        explore_query, ctx, "lite", file_paths,
+        media_paths, file_uris, False, None, cached_content,
+        role="explorer"
+    )
+
+    # Check for internal system errors (plain str return = system failure)
+    # ToolResult means the model responded — even if its text mentions "Error"
+    if isinstance(explore_result, str) and explore_result.startswith("Error:"):
+        return explore_result
+
+    # Phase 2: Synthesis model analyzes (tools available to fill gaps)
+    synth_role = "thinker" if synth_model == "pro" else "analyst"
+    if ctx:
+        await ctx.info(f"Phase 2: {synth_model.capitalize()} synthesis (role={synth_role})...")
+    synthesis_query = _SYNTHESIS_PROMPT.format(query=query)
     return await _consult(
-        query, ctx, alias, file_paths,
-        media_paths, file_uris, json_mode, response_schema, cached_content
+        synthesis_query, ctx, synth_model, None,
+        None, None, json_mode, response_schema, cached_content,
+        role=synth_role
     )
 
 
@@ -1561,7 +1667,7 @@ async def consult_gemini_oneshot(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
             ),
-            "system_instruction": _system_instruction,
+            "system_instruction": _compose_instruction(_SYSTEM_AGENT),
             "http_options": _NO_SDK_RETRY,
         }
         if json_mode:
@@ -1606,9 +1712,7 @@ async def consult_gemini_oneshot(
                 },
             )
         except genai_errors.APIError as e:
-            if _is_retriable_genai_error(e):
-                return f"Error: Service temporarily unavailable after retries: {e}"
-            return f"Error: {e}"
+            return _format_api_error(e, model)
         except Exception as e:
             return f"Error: {e}"
 
@@ -1976,7 +2080,7 @@ def setup_otel(endpoint: str | None = None) -> None:
     propagate.set_global_textmap(TraceContextTextMapPropagator())
 
 def main() -> None:
-    global _cli_key_file, _system_instruction, _system_instruction_sources
+    global _cli_key_file, _user_instruction, _user_instruction_sources
     parser = argparse.ArgumentParser(description="gpal - Your Pal Gemini")
     parser.add_argument("--otel-endpoint", help="OTLP gRPC endpoint (e.g., localhost:4317)")
     parser.add_argument(
@@ -2001,14 +2105,14 @@ def main() -> None:
     if args.api_key_file:
         _cli_key_file = args.api_key_file
 
-    # Load config and compose system instruction
+    # Load config and compose user instruction layers
     config = _load_config()
-    _system_instruction, _system_instruction_sources = _build_system_instruction(
+    _user_instruction, _user_instruction_sources = _build_system_instruction(
         config,
         cli_prompt_files=args.system_prompt,
         no_default=args.no_default_prompt,
     )
-    logger.info("System instruction sources: %s", _system_instruction_sources)
+    logger.info("System instruction sources: %s", _user_instruction_sources)
 
     setup_otel(args.otel_endpoint)
     mcp.run()

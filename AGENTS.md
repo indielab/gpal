@@ -84,7 +84,8 @@ We always prefer the latest and most capable models available from Google.
 
 | Model | Alias | Best For |
 |-------|-------|----------|
-| `gemini-3-flash-preview` | `flash` | Fast exploration, searching, listing |
+| `gemini-2.5-flash-lite` | `lite` | Cheap exploration (auto mode Phase 1) |
+| `gemini-3-flash-preview` | `flash` | Frontier synthesis, searching, analysis |
 | `gemini-3.1-pro-preview` | `pro` | Deep reasoning, synthesis, code review |
 | `gemini-flash-latest` | — | Web search, code execution (auto-updates) |
 | `imagen-4.0-ultra-generate-001` | `imagen` | Ultra quality image generation (default) |
@@ -113,7 +114,7 @@ and converts `TimeoutError` to `McpError(-32000)`.
 
 | Tool | Timeout | Rationale |
 |------|---------|-----------|
-| `consult_gemini` | 660s | Unified tool (auto mode: Flash explore + Pro synthesize) |
+| `consult_gemini` | 660s | Unified tool (auto mode: Lite explore + synthesis) |
 | `consult_gemini_oneshot` | 600s | Stateless queries (Pro+thinking can be slow) |
 | `rebuild_index` | 300s | Large index rebuilds |
 | All others | None | Quick sync operations |
@@ -131,11 +132,23 @@ FastMCP 3.0 handles distributed trace context automatically via `inject_trace_co
 
 ### `consult_gemini` Tool
 
-Single unified tool for all Gemini consultations:
+Single unified tool for all Gemini consultations. Always runs a Lite exploration phase
+first, then hands off to the requested model for synthesis:
 
-- **`model="auto"`** (default): Two-phase pipeline. Flash aggressively loads full file contents into context (reads everything in full — Pro can't fill gaps). Then Pro runs with **no tools and thinking enabled** — pure deep analysis over the rich context Flash loaded. Uses session history migration — same session ID, Flash history flows to Pro automatically.
-- **`model="flash"`** or **`model="pro"`**: Direct pass-through to a specific model.
-- **`consult_gemini_oneshot`**: Separate stateless tool, no session. For independent questions where conversation context is noise.
+| `model=` | Phase 1 (explore) | Phase 2 (synthesize) | Notes |
+|----------|-------------------|---------------------|-------|
+| `"auto"` | Lite | Flash | New default |
+| `"flash"` | Lite | Flash | Same as auto |
+| `"pro"` | Lite | Pro (thinking HIGH) | Deep synthesis |
+| `"lite"` | — | Lite direct | No pipeline |
+| full model ID | — | Direct pass-through | Backward compat |
+
+- **Lite exploration**: Lite (Haiku-class) does cheap mechanical exploration — `cat` and `ls`
+  with navigation. 1M context window, AFC enabled.
+- **Flash synthesis** (role=analyst): Frontier model with tools still available to fill gaps.
+- **Pro synthesis** (role=thinker): Deep thinking enabled, tools available to fill gaps.
+- **`consult_gemini_oneshot`**: Separate stateless tool, no session. For independent questions
+  where conversation context is noise.
 
 ### Token Tracking & Rate Limiting
 
@@ -288,9 +301,16 @@ include_default_prompt = true
 Paths support `~` and `$ENV_VAR` expansion.
 
 **Composition order:**
-1. Built-in `DEFAULT_SYSTEM_INSTRUCTION` (if `include_default_prompt` is true and `--no-default-prompt` not set)
-2. Files from `system_prompts` list (in order)
-3. Inline `system_prompt` from config.toml
-4. Files from `--system-prompt` CLI flags (in order)
+1. Role-specific built-in prompt (`_SYSTEM_EXPLORER`, `_SYSTEM_THINKER`, or `_SYSTEM_AGENT`)
+2. User layers (appended after the role prompt):
+   a. Files from `system_prompts` list (in order)
+   b. Inline `system_prompt` from config.toml
+   c. Files from `--system-prompt` CLI flags (in order)
+
+Role prompts share a common `_SYSTEM_BASE` identity. The role is selected automatically:
+- **explorer**: Lite in explore phase (aggressive tool use, thoroughness)
+- **analyst**: Flash in synthesis phase (frontier model, tools available)
+- **thinker**: Pro in synthesis phase (deep thinking HIGH, tools available)
+- **agent**: Direct model calls and oneshot (tools enabled)
 
 All joined with `\n\n`. Provenance visible in `gpal://info`.

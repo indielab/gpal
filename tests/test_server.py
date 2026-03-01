@@ -18,7 +18,7 @@ from gpal.server import (
     mcp, _validate_input_path, _validate_output_path,
     record_tokens, tokens_in_window, token_stats, GeminiResponse,
     _sync_throttle, _async_throttle, _KNOWN_MODELS, MODEL_SEARCH,
-    RATE_LIMITS_TPM, _afc_local, _send_with_retry, _EXECUTOR,
+    MODEL_LITE, RATE_LIMITS_TPM, _afc_local, _send_with_retry, _EXECUTOR,
     _extract_retry_delay, _is_retriable_genai_error,
     search_project,
 )
@@ -303,6 +303,7 @@ async def test_info_resource():
         data = json.loads(text)
         assert "models" in data
         assert "limits" in data
+        assert "lite" in data["models"]
         assert "flash" in data["models"]
         assert "token_usage" in data
 
@@ -316,6 +317,12 @@ def test_model_search_in_known_models():
     """MODEL_SEARCH is tracked (present in _KNOWN_MODELS and RATE_LIMITS_TPM)."""
     assert MODEL_SEARCH in _KNOWN_MODELS
     assert MODEL_SEARCH in RATE_LIMITS_TPM
+
+
+def test_model_lite_in_known_models():
+    """MODEL_LITE is tracked (present in _KNOWN_MODELS and RATE_LIMITS_TPM)."""
+    assert MODEL_LITE in _KNOWN_MODELS
+    assert MODEL_LITE in RATE_LIMITS_TPM
 
 
 def test_sync_throttle_no_block_under_limit():
@@ -528,3 +535,10 @@ def test_search_project_rejects_absolute_glob(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = search_project("test", glob_pattern="/etc/**/*")
     assert "absolute" in result.lower()
+
+
+def test_search_project_rejects_traversal_glob(tmp_path, monkeypatch):
+    """Glob patterns with '..' are rejected to prevent filesystem traversal DoS."""
+    monkeypatch.chdir(tmp_path)
+    result = search_project("test", glob_pattern="../../**/*")
+    assert ".." in result
