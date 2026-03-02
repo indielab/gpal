@@ -84,7 +84,7 @@ We always prefer the latest and most capable models available from Google.
 
 | Model | Alias | Best For |
 |-------|-------|----------|
-| `gemini-2.5-flash-lite` | `lite` | Cheap exploration (auto mode Phase 1) |
+| `gemini-flash-lite-latest` | `lite` | Cheap exploration (auto mode Phase 1, auto-updates) |
 | `gemini-3-flash-preview` | `flash` | Frontier synthesis, searching, analysis |
 | `gemini-3.1-pro-preview` | `pro` | Deep reasoning, synthesis, code review |
 | `gemini-flash-latest` | — | Web search, code execution (auto-updates) |
