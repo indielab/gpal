@@ -66,7 +66,7 @@ logging.basicConfig(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Model versions (centralized for easy updates)
-MODEL_LITE = "gemini-2.5-flash-lite"
+MODEL_LITE = "gemini-flash-lite-latest"       # Auto-updates to latest stable Lite
 MODEL_FLASH = "gemini-3-flash-preview"
 MODEL_PRO = "gemini-3.1-pro-preview"
 MODEL_SEARCH = "gemini-flash-latest"          # Auto-updates to latest stable Flash
