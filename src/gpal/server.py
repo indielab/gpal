@@ -888,8 +888,32 @@ def list_directory(path: str = ".") -> list[str] | str:
         return msg
 
 
-def read_file(path: str) -> str:
-    """Read the content of a file (up to MAX_FILE_SIZE bytes)."""
+def _number_lines(lines: list[str], start: int = 1) -> str:
+    """Render lines in `cat -n` style: right-aligned line number, tab, content.
+
+    `start` is the 1-based line number of `lines[0]`. The gutter width adapts to
+    the largest line number shown, with a minimum of 6 (matching `cat -n`), so
+    every line in a single read shares one consistent gutter."""
+    if not lines:
+        return ""
+    last = start + len(lines) - 1
+    width = max(6, len(str(last)))
+    return "\n".join(
+        f"{n:>{width}}\t{line}"
+        for n, line in enumerate(lines, start=start)
+    )
+
+
+def read_file(path: str, offset: int = 1, limit: int | None = None) -> str:
+    """Read a text file, returned with `cat -n` style line numbers for citation.
+
+    Args:
+        path: File to read (must be within the project root).
+        offset: 1-based line number to start at (default 1, the file's start).
+        limit: Maximum number of lines to return (default: to end of file).
+               Use offset+limit to page through large files; a header reveals
+               the total line count so you know when there's more to read.
+    """
     err = _validate_input_path(path)
     if err:
         return err
@@ -901,9 +925,39 @@ def read_file(path: str) -> str:
 
         if p.stat().st_size > MAX_FILE_SIZE:
             return f"Error: File '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
-        return p.read_text(encoding="utf-8", errors="replace")
+
+        content = p.read_text(encoding="utf-8", errors="replace")
+        lines = content.splitlines()
+        total = len(lines)
+        if total == 0:
+            return f"[{path} is empty]"
+
+        start = max(1, offset)
+        if start > total:
+            return f"[{path}: offset {start} is beyond end of file ({total} lines)]"
+
+        count = total if limit is None else max(1, limit)
+        end = min(total, start - 1 + count)
+        numbered = _number_lines(lines[start - 1:end], start=start)
+
+        # Header only for a partial view, so whole-file reads stay clean.
+        if start > 1 or end < total:
+            return f"[{path} lines {start}-{end} of {total}]\n{numbered}"
+        return numbered
     except Exception as e:
         return f"Error reading file '{path}': {e}"
+
+
+def _build_file_context(path: str) -> str:
+    """Read a text file (size-checked) and wrap it with markers + line numbers
+    for inline `file_paths` context. Raises ValueError on oversize so the caller
+    can surface a clean error string. Runs in the thread pool — keep it sync."""
+    p = Path(path)
+    if p.stat().st_size > MAX_FILE_SIZE:
+        raise ValueError(f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit.")
+    content = p.read_text(encoding="utf-8", errors="replace")
+    numbered = _number_lines(content.splitlines(), start=1)
+    return f"--- START FILE: {path} ---\n{numbered}\n--- END FILE: {path} ---\n"
 
 
 def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
@@ -1360,18 +1414,12 @@ async def _consult(
             if err:
                 return err
             try:
-                p = Path(path)
-                size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
-                if size > MAX_FILE_SIZE:
-                    return f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
-                content = await loop.run_in_executor(
-                    _EXECUTOR, lambda p=p: p.read_text(encoding="utf-8", errors="replace")
-                )
-                parts.append(types.Part.from_text(
-                    text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
-                ))
+                text = await loop.run_in_executor(_EXECUTOR, _build_file_context, path)
+            except ValueError as e:
+                return str(e)
             except Exception as e:
                 return f"Error reading file '{path}': {e}"
+            parts.append(types.Part.from_text(text=text))
 
         # Context: Inline media (offloaded to thread pool)
         for path in media_paths or []:
@@ -1691,18 +1739,12 @@ async def consult_gemini_oneshot(
             if err:
                 return err
             try:
-                p = Path(path)
-                size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
-                if size > MAX_FILE_SIZE:
-                    return f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
-                content = await loop.run_in_executor(
-                    _EXECUTOR, lambda p=p: p.read_text(encoding="utf-8", errors="replace")
-                )
-                parts.append(types.Part.from_text(
-                    text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
-                ))
+                text = await loop.run_in_executor(_EXECUTOR, _build_file_context, path)
+            except ValueError as e:
+                return str(e)
             except Exception as e:
                 return f"Error reading file '{path}': {e}"
+            parts.append(types.Part.from_text(text=text))
 
         for path in media_paths or []:
             err = _validate_input_path(path)

@@ -6,6 +6,7 @@ from google.genai import types
 from gpal.server import (
     list_directory, read_file, search_project, detect_mime_type, MIME_TYPES,
     create_batch, get_batch, list_batches, get_batch_results, cancel_batch, delete_batch,
+    _number_lines, _build_file_context,
 )
 
 def test_list_directory(tmp_path, monkeypatch):
@@ -30,21 +31,107 @@ def test_list_directory_nonexistent(tmp_path, monkeypatch):
     assert isinstance(result, str)
     assert "does not exist" in result
 
+# --- _number_lines (pure formatting helper) ---
+
+def test_number_lines_basic():
+    out = _number_lines(["import os", "import sys"], start=1)
+    rows = out.split("\n")
+    assert rows[0] == "     1\timport os"   # 6-wide gutter + tab, cat -n style
+    assert rows[1] == "     2\timport sys"
+
+def test_number_lines_width_min_six():
+    # Single-digit line numbers still pad to width 6 (matches cat -n).
+    out = _number_lines(["only"], start=1)
+    assert out == "     1\tonly"
+
+def test_number_lines_width_grows_for_large_files():
+    rows = [f"line{i}" for i in range(1, 1001)]
+    out = _number_lines(rows, start=1).split("\n")
+    assert out[0] == "     1\tline1"      # still width 6 (matches 1000)
+    assert out[-1] == "  1000\tline1000"
+
+def test_number_lines_respects_start_offset():
+    out = _number_lines(["a", "b"], start=100)
+    rows = out.split("\n")
+    assert rows[0] == "   100\ta"
+    assert rows[1] == "   101\tb"
+
+def test_number_lines_empty():
+    assert _number_lines([], start=1) == ""
+
+def test_number_lines_preserves_blank_lines():
+    out = _number_lines(["x", "", "y"], start=1)
+    rows = out.split("\n")
+    assert rows[1] == "     2\t"           # blank source line keeps its number
+
+
+# --- read_file (now numbered + ranged) ---
+
 def test_read_file(tmp_path, monkeypatch):
     test_file = tmp_path / "test.txt"
-    content = "Sample content for testing."
-    test_file.write_text(content)
-
-    # Change cwd so tmp_path is within "project root"
+    test_file.write_text("alpha\nbeta\ngamma\n")
     monkeypatch.chdir(tmp_path)
 
     result = read_file("test.txt")
-    assert result == content
+    assert "     1\talpha" in result
+    assert "     2\tbeta" in result
+    assert "     3\tgamma" in result
+
+def test_read_file_whole_file_has_no_range_notice(tmp_path, monkeypatch):
+    (tmp_path / "t.txt").write_text("one\ntwo\n")
+    monkeypatch.chdir(tmp_path)
+    result = read_file("t.txt")
+    assert "of 2" not in result           # full read => no truncation header
+
+def test_read_file_offset_and_limit(tmp_path, monkeypatch):
+    (tmp_path / "t.txt").write_text("\n".join(f"L{i}" for i in range(1, 11)) + "\n")
+    monkeypatch.chdir(tmp_path)
+
+    result = read_file("t.txt", offset=3, limit=2)
+    assert "     3\tL3" in result
+    assert "     4\tL4" in result
+    assert "L2" not in result             # before the window
+    assert "L5" not in result             # after the window
+    assert "of 10" in result              # notice reveals the file is longer
+
+def test_read_file_offset_beyond_eof(tmp_path, monkeypatch):
+    (tmp_path / "t.txt").write_text("only\n")
+    monkeypatch.chdir(tmp_path)
+    result = read_file("t.txt", offset=50)
+    assert "beyond" in result.lower()
+
+def test_read_file_empty(tmp_path, monkeypatch):
+    (tmp_path / "empty.txt").write_text("")
+    monkeypatch.chdir(tmp_path)
+    result = read_file("empty.txt")
+    assert "empty" in result.lower()
 
 def test_read_file_error(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = read_file("this_file_does_not_exist_at_all.txt")
     assert "does not exist" in result
+
+
+# --- _build_file_context (inline file_paths) ---
+
+def test_build_file_context_numbers_and_wraps(tmp_path, monkeypatch):
+    f = tmp_path / "mod.py"
+    f.write_text("def f():\n    return 1\n")
+    monkeypatch.chdir(tmp_path)
+
+    out = _build_file_context("mod.py")
+    assert "--- START FILE: mod.py ---" in out
+    assert "--- END FILE: mod.py ---" in out
+    assert "     1\tdef f():" in out
+    assert "     2\t    return 1" in out
+
+def test_build_file_context_rejects_oversize(tmp_path, monkeypatch):
+    from gpal.server import MAX_FILE_SIZE
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * (MAX_FILE_SIZE + 1))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="exceeds"):
+        _build_file_context("big.bin")
 
 def test_search_project(tmp_path, monkeypatch):
     # Setup dummy files
