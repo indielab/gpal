@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import select
 import sys
 import threading
 import tomllib
@@ -88,6 +89,14 @@ MODEL_ALIASES: dict[str, str] = {
     "nano-flash": MODEL_IMAGE_FLASH,
     "speech": MODEL_SPEECH,
     "speech-fast": MODEL_SPEECH_FAST,
+}
+
+# Valid thinking level names → SDK enum values (shared by _consult and consult_gemini_oneshot)
+_THINKING_LEVELS: dict[str, str] = {
+    "minimal": "MINIMAL",
+    "low": "LOW",
+    "medium": "MEDIUM",
+    "high": "HIGH",
 }
 
 # Limits
@@ -274,9 +283,10 @@ def tokens_in_window(model: str, window_secs: float = 60.0) -> int:
     now = time.monotonic()
     cutoff = now - window_secs
     with _token_lock:
-        window = _token_windows.get(model, [])
-        # Prune expired entries
-        _token_windows[model] = window = [(t, c) for t, c in window if t > cutoff]
+        if model not in _token_windows:
+            return 0
+        window = [(t, c) for t, c in _token_windows[model] if t > cutoff]
+        _token_windows[model] = window
         return sum(c for _, c in window)
 
 
@@ -564,14 +574,44 @@ def _compose_instruction(role_prompt: str) -> str:
 # Server & State
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _stdin_disconnected(fd: int) -> bool:
+    """Return True if stdin peer has disconnected or the fd is invalid.
+
+    Two detection methods:
+    1. OSError from os.fstat() — fd closed in this process.
+    2. select.poll() POLLHUP/POLLERR/POLLNVAL — peer closed its end of the
+       pipe. POLLHUP can coincide with buffered POLLIN data; we accept
+       exiting then because the client is gone regardless.
+
+    Falls back to fstat-only on platforms without select.poll (e.g. Windows).
+    """
+    try:
+        os.fstat(fd)
+    except OSError:
+        return True
+
+    try:
+        p = select.poll()
+        p.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL)
+        events = p.poll(0)
+        if events:
+            revents = events[0][1]
+            if revents & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                return True
+    except AttributeError:
+        # select.poll not available (non-Linux platforms)
+        pass
+
+    return False
+
+
 async def _stdin_watchdog() -> None:
-    """Exit if the MCP client disconnects (stdin fd closed).
+    """Exit if the MCP client disconnects (stdin fd closed or pipe broken).
 
-    Polls every 5s using os.fstat(). If the fd becomes invalid (client
-    crashed, pipe broken), the server exits cleanly. This prevents orphaned
-    gpal processes from spinning CPU after the client disappears.
+    Polls every 5s via _stdin_disconnected(). This prevents orphaned gpal
+    processes from spinning CPU after the client disappears.
 
-    Uses fstat() — not read() — to avoid consuming bytes from the MCP
+    Uses fstat()/poll() — not read() — to avoid consuming bytes from the MCP
     stdio transport stream.
     """
     try:
@@ -582,10 +622,8 @@ async def _stdin_watchdog() -> None:
 
     while True:
         await asyncio.sleep(5)
-        try:
-            os.fstat(fd)
-        except OSError:
-            logger.info("stdin fd invalid — client disconnected, exiting")
+        if _stdin_disconnected(fd):
+            logger.info("stdin disconnected — client gone, exiting")
             os._exit(0)
 
 
@@ -869,7 +907,11 @@ def _validate_output_path(path: str) -> str | None:
 
 
 def list_directory(path: str = ".") -> list[str] | str:
-    """List files and directories at the given path."""
+    """List files and directories at the given path.
+
+    Directory entries are returned with a trailing "/" so the caller can
+    distinguish them from files without an extra round-trip.
+    """
     err = _validate_input_path(path)
     if err:
         logging.warning(err)
@@ -881,7 +923,10 @@ def list_directory(path: str = ".") -> list[str] | str:
             msg = f"Error: Path '{path}' does not exist"
             logging.warning(msg)
             return msg
-        return [item.name for item in p.iterdir()]
+        return [
+            (item.name + "/" if item.is_dir() else item.name)
+            for item in p.iterdir()
+        ]
     except Exception as e:
         msg = f"Error listing directory: {e}"
         logging.error(msg)
@@ -936,7 +981,9 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> str:
         if start > total:
             return f"[{path}: offset {start} is beyond end of file ({total} lines)]"
 
-        count = total if limit is None else max(1, limit)
+        if limit is not None and limit < 1:
+            return f"Error: limit must be >= 1, got {limit}."
+        count = total if limit is None else limit
         end = min(total, start - 1 + count)
         numbered = _number_lines(lines[start - 1:end], start=start)
 
@@ -977,6 +1024,7 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
         # Use iglob iterator to avoid loading huge file lists into memory
         matches = []
         files_checked = 0
+        skipped_large = 0
 
         for filepath in globlib.iglob(glob_pattern, recursive=True):
             path_obj = Path(filepath).resolve()
@@ -991,6 +1039,9 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
                 break
 
             try:
+                if path_obj.stat().st_size > MAX_FILE_SIZE:
+                    skipped_large += 1
+                    continue
                 with open(filepath, encoding="utf-8", errors="replace") as f:
                     if search_term in f.read():
                         matches.append(f"Match in: {filepath}")
@@ -1000,6 +1051,8 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
             except OSError:
                 continue
 
+        if skipped_large:
+            matches.append(f"... (skipped {skipped_large} files over the size limit)")
         return "\n".join(matches) if matches else "No matches found."
 
     except Exception as e:
@@ -1051,15 +1104,47 @@ def _load_api_key() -> str | None:
     return None
 
 
-def get_client() -> genai.Client:
-    """Create a Gemini API client from environment or key file."""
+_cached_client: genai.Client | None = None
+_client_lock = threading.Lock()
+
+
+def get_client(force_new: bool = False) -> genai.Client:
+    """Return a cached Gemini API client, building one on first call.
+
+    genai.Client is httpx-backed and thread-safe for concurrent use.
+    Caching avoids rebuilding the underlying HTTP connection pool on every
+    AFC callback. force_new=True builds a fresh client and replaces the cache
+    (used in stale-client recovery).
+
+    The entire force_new path (build + swap) runs under _client_lock so that
+    concurrent force_new callers don't race and leak displaced clients.
+    """
+    global _cached_client
+    # Fast path: no lock needed when the cache is already warm and force_new is off.
+    if not force_new and _cached_client is not None:
+        return _cached_client
     api_key = _load_api_key()
     if not api_key:
         raise ValueError(
             "Gemini API key not found. Set GEMINI_API_KEY environment variable "
             f"or create {DEFAULT_KEY_FILES[0]}"
         )
-    return genai.Client(api_key=api_key)
+    with _client_lock:
+        # Re-check after acquiring: another thread may have populated the cache.
+        if not force_new and _cached_client is not None:
+            return _cached_client
+        displaced = _cached_client
+        client = genai.Client(api_key=api_key)
+        _cached_client = client
+    # Best-effort close outside the lock to avoid holding it during I/O.
+    # Current google-genai lacks a public close() — AttributeError is swallowed
+    # deliberately; this is intentional best-effort cleanup, not a guarantee.
+    if displaced is not None and displaced is not client:
+        try:
+            displaced.close()
+        except Exception:
+            pass
+    return client
 
 
 def _ensure_stores_initialized() -> None:
@@ -1089,17 +1174,12 @@ def _ensure_stores_initialized() -> None:
             logging.debug(f"Deferred FileSearch initialization: {e}")
 
 
-def _build_afc_tools(include_search: bool = True) -> list:
-    """Build the AFC tool list with UrlContext and conditional FileSearch.
+def _build_afc_tools() -> list:
+    """Build the AFC tool list with git, web search, and optional FileSearch.
 
-    Args:
-        include_search: Include gemini_search (web search) in the list.
-            False for create_chat's minimal config.
+    Note: url_context cannot be combined with Function Calling (API restriction).
     """
-    # Note: url_context cannot be combined with Function Calling (API restriction)
-    tools: list = [list_directory, read_file, search_project, git]
-    if include_search:
-        tools.append(gemini_search)
+    tools: list = [list_directory, read_file, search_project, git, gemini_search]
     # Add FileSearch if any stores are active
     _ensure_stores_initialized()
     with _stores_lock:
@@ -1116,17 +1196,6 @@ def create_chat(
     config: types.GenerateContentConfig | None = None,
 ) -> Any:
     """Create a configured Gemini chat session."""
-    if config is None:
-        config = types.GenerateContentConfig(
-            temperature=0.2,
-            tools=_build_afc_tools(include_search=False),
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=False,
-                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
-            ),
-            system_instruction=_compose_instruction(_SYSTEM_AGENT),
-        )
-
     return client.chats.create(
         model=model_name,
         history=history or [],
@@ -1170,49 +1239,88 @@ def _sanitize_history(history: list) -> bool:
     return changed
 
 
-async def get_session(
-    ctx: Context,
-    client: genai.Client,
-    model_alias: str,
-    config: types.GenerateContentConfig | None = None,
-) -> tuple[Any, asyncio.Lock]:
-    """Get or create a session, bundled with its own lock."""
-    session_id = ctx.session_id
-    target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+def _get_or_create_session_entry(session_id: str, client: genai.Client, target_model: str) -> tuple[Any, asyncio.Lock]:
+    """Under sessions_lock, return the existing (session, lock) or create a new placeholder.
 
+    Caller must NOT hold sessions_lock already. The returned lock is NOT yet
+    acquired — callers must do that themselves.
+    """
     with sessions_lock:
         if session_id in sessions:
             session, lock = sessions[session_id]
-        else:
-            session = create_chat(client, target_model, config=config)
-            session._gpal_model = target_model
-            lock = asyncio.Lock()
+            # Refresh TTL so long single-model conversations don't silently expire.
             sessions[session_id] = (session, lock)
-            ctx.set_state("model", target_model)
             return session, lock
-
-    # Use per-session lock for migration and history sanitization
-    async with lock:
-        current_model = getattr(session, "_gpal_model", None)
-        history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
-
-        needs_recreate = _sanitize_history(history)
-
-        if current_model == target_model and not needs_recreate:
-            return session, lock
-
-        logging.info(f"Recreating session '{session_id}': {current_model} → {target_model}, sanitized={needs_recreate}")
-        try:
-            session = create_chat(client, target_model, history=history, config=config)
-        except Exception as e:
-            logging.error(f"Session recreation failed: {e}")
-            session = create_chat(client, target_model, config=config)
-
+        session = create_chat(client, target_model)
         session._gpal_model = target_model
-        with sessions_lock:
-            sessions[session_id] = (session, lock)
-        ctx.set_state("model", target_model)
+        lock = asyncio.Lock()
+        sessions[session_id] = (session, lock)
         return session, lock
+
+
+def _ensure_session_model(
+    session_id: str,
+    client: genai.Client,
+    target_model: str,
+    config: types.GenerateContentConfig | None,
+    lock: asyncio.Lock,
+    current_session: Any = None,
+) -> Any:
+    """Check/migrate the session to target_model. CALLER MUST HOLD the per-session lock.
+
+    Re-reads the current entry from sessions so that any concurrent migration that
+    completed before we acquired the lock is respected. Recreates and stores the
+    session when the model differs or history sanitization was needed.
+    Returns the (possibly new) session object.
+
+    Orphan semantics: if the cache entry was evicted and recreated by another coroutine
+    (stored_lock is not our lock), we are "orphaned" — we operate on current_session and
+    do NOT overwrite the cache, so the concurrent coroutine's entry remains authoritative.
+    This prevents two coroutines from mutating the same genai Chat object under different
+    locks. current_session is the session object returned by _get_or_create_session_entry.
+    """
+    orphaned = False
+    with sessions_lock:
+        entry = sessions.get(session_id)
+        if entry is None:
+            # Entry evicted before we acquired the lock and nobody replaced it.
+            # Operate on current_session (or create fresh) and re-insert under our lock.
+            session = current_session if current_session is not None else create_chat(client, target_model)
+            session._gpal_model = target_model
+            sessions[session_id] = (session, lock)
+            return session
+        session, stored_lock = entry
+        if stored_lock is not lock:
+            # Another coroutine evicted + recreated the entry with a new lock.
+            # We are orphaned: operate on current_session, leave the cache untouched.
+            orphaned = True
+            session = current_session if current_session is not None else session
+
+    current_model = getattr(session, "_gpal_model", None)
+    history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
+    needs_recreate = _sanitize_history(history)
+
+    if current_model == target_model and not needs_recreate:
+        return session
+
+    logging.info(f"Recreating session '{session_id}': {current_model} → {target_model}, sanitized={needs_recreate}")
+    try:
+        new_session = create_chat(client, target_model, history=history, config=config)
+    except Exception as e:
+        logging.error(f"Session recreation failed: {e}")
+        new_session = create_chat(client, target_model, config=config)
+
+    new_session._gpal_model = target_model
+    if not orphaned:
+        # Only write back if we still own the entry: absent or our lock is stored.
+        with sessions_lock:
+            stored = sessions.get(session_id)
+            if stored is None or stored[1] is lock:
+                sessions[session_id] = (new_session, lock)
+    return new_session
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1326,7 +1434,12 @@ async def _consult(
     role: str = "agent",
     thinking: str | None = None,
 ) -> str | ToolResult:
-    """Send a query to Gemini with codebase context."""
+    """Send a query to Gemini with codebase context.
+
+    Returns a ToolResult on success (the model produced a response).
+    Returns a plain str ONLY on system errors (validation failure, API error,
+    session error, etc.). Callers must treat any plain-str return as an error.
+    """
     t0 = time.monotonic()
     tracer = trace.get_tracer("gpal")
 
@@ -1338,6 +1451,7 @@ async def _consult(
         
         client = get_client()
         session_id = ctx.session_id
+        loop = asyncio.get_running_loop()
 
         def _wrap(resp: GeminiResponse) -> ToolResult:
             resolved = MODEL_ALIASES.get(model_alias.lower(), model_alias)
@@ -1360,7 +1474,10 @@ async def _consult(
 
         # Build generation config
         # Tools + AFC always enabled so history with function calls stays valid
-        # and synthesis models can fill gaps the explorer missed
+        # and synthesis models can fill gaps the explorer missed — EXCEPT when
+        # json_mode is active (the Gemini API rejects JSON mode + function calling).
+        # Skip the _build_afc_tools round-trip entirely when json_mode to avoid
+        # unnecessary I/O; we drop the tools below anyway.
         _role_prompts = {
             "explorer": _SYSTEM_EXPLORER,
             "thinker": _SYSTEM_THINKER,
@@ -1368,24 +1485,39 @@ async def _consult(
             "agent": _SYSTEM_AGENT,
         }
         role_prompt = _role_prompts.get(role, _SYSTEM_AGENT)
-        config_kwargs: dict[str, Any] = {
-            "temperature": 0.2,
-            "tools": _build_afc_tools(include_search=True),
-            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
-                disable=False,
-                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
-            ),
-            "system_instruction": _compose_instruction(role_prompt),
-            "http_options": _NO_SDK_RETRY,
-        }
+
+        if not json_mode:
+            # _build_afc_tools may call _ensure_stores_initialized which does network
+            # I/O (file_search_stores.list) and disk I/O (get_client reads key files).
+            # Run it in the thread pool to avoid blocking the event loop.
+            afc_tools = await loop.run_in_executor(_EXECUTOR, lambda: _build_afc_tools())
+            config_kwargs: dict[str, Any] = {
+                "temperature": 0.2,
+                "tools": afc_tools,
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                    disable=False,
+                    maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
+                ),
+                "system_instruction": _compose_instruction(role_prompt),
+                "http_options": _NO_SDK_RETRY,
+            }
+        else:
+            # json_mode: omit tools and automatic_function_calling — the Gemini API
+            # rejects JSON mode combined with function calling. Session history may
+            # contain function_call/function_response parts from earlier tool-using
+            # turns; we accept that risk rather than guaranteeing a 400 by keeping tools.
+            config_kwargs = {
+                "temperature": 0.2,
+                "system_instruction": _compose_instruction(role_prompt),
+                "http_options": _NO_SDK_RETRY,
+            }
 
         # Thinking level: explicit parameter > role-based default (HIGH for thinker)
         _thinking = thinking
         if _thinking is None and role == "thinker":
             _thinking = "high"
         if _thinking is not None:
-            _level_map = {"minimal": "MINIMAL", "low": "LOW", "medium": "MEDIUM", "high": "HIGH"}
-            sdk_level = _level_map.get(_thinking.lower())
+            sdk_level = _THINKING_LEVELS.get(_thinking.lower())
             if not sdk_level:
                 return f"Error: Invalid thinking level '{_thinking}'. Must be one of: minimal, low, medium, high."
             config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=sdk_level)
@@ -1403,10 +1535,7 @@ async def _consult(
 
         gen_config = types.GenerateContentConfig(**config_kwargs)
 
-        session, lock = await get_session(ctx, client, model_alias, gen_config)
-
         parts: list[types.Part] = []
-        loop = asyncio.get_running_loop()
 
         # Context: Text files (offloaded to thread pool to avoid blocking event loop)
         for path in file_paths or []:
@@ -1463,9 +1592,23 @@ async def _consult(
         resolved_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
         await _async_throttle(resolved_model, ctx)
 
-        # Send with one retry on stale client
+        # Get-or-create the cache entry so we have the lock object before acquiring.
+        # The lock is NOT held yet; we acquire it below and keep it through the send
+        # so that concurrent consults for the same session cannot race on model migration.
+        target_model = resolved_model
+        initial_session, lock = _get_or_create_session_entry(session_id, client, target_model)
+
+        # Send with one retry on stale client, holding the lock continuously so that
+        # model-check, migration, and send are atomic with respect to other coroutines.
+        session = None
         for attempt in range(2):
             async with lock:
+                # Re-read the current session under the lock; _ensure_session_model
+                # may recreate it if the model changed or history needs sanitising.
+                # Pass initial_session so orphan detection can use it if the cache entry
+                # was evicted and replaced by another coroutine between get-or-create and here.
+                session = _ensure_session_model(session_id, client, target_model, gen_config, lock, initial_session)
+                ctx.set_state("model", target_model)
                 try:
                     def _run():
                         _afc_local.mcp_ctx = ctx
@@ -1489,16 +1632,23 @@ async def _consult(
                     try:
                         prev_history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
                         _sanitize_history(prev_history)
-                        new_client = get_client()
-                        target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
-                        session = create_chat(new_client, target_model, history=prev_history, config=gen_config)
-                        session._gpal_model = target_model
+                        # Disk reads (key file) + httpx pool construction block the
+                        # event loop; offload to the thread pool like other I/O here.
+                        def _rebuild():
+                            nc = get_client(force_new=True)
+                            s = create_chat(nc, target_model, history=prev_history, config=gen_config)
+                            s._gpal_model = target_model
+                            return s
+                        session = await loop.run_in_executor(_EXECUTOR, _rebuild)
                     except Exception as retry_e:
                         return f"Error recreating session: {retry_e}"
 
-            # Update global state before retry
-            with sessions_lock:
-                sessions[session_id] = (session, lock)
+                    # Store updated session while still holding lock, but only if we
+                    # still own the entry (absent or our lock is stored).
+                    with sessions_lock:
+                        stored = sessions.get(session_id)
+                        if stored is None or stored[1] is lock:
+                            sessions[session_id] = (session, lock)
 
 @GEMINI_RETRY_DECORATOR
 def _send_with_retry(session: Any, parts: list[types.Part], config: types.GenerateContentConfig) -> GeminiResponse:
@@ -1563,10 +1713,10 @@ def gemini_search(
     """
     return _gemini_search(query, num_results, model)
 
-mcp.tool(gemini_search)
+mcp.tool(gemini_search, timeout=120, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@mcp.tool(timeout=120, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
 def gemini_code_exec(
     code: Annotated[str, Field(description="Python code to execute")],
     model: Annotated[str, Field(default=MODEL_CODE_EXEC, description="Model to use for code execution")] = MODEL_CODE_EXEC,
@@ -1653,9 +1803,18 @@ async def consult_gemini(
     Pipeline: For auto, flash, and pro, Lite explores quickly first, then
     our selected model synthesizes. "lite" and explicit model IDs skip
     the exploration phase and query directly.
-    Gemini's tools: list_directory, read_file, search_project."""
-    if ctx:
-        await ctx.debug(f"consult_gemini: model={model}, session={ctx.session_id}, files={len(file_paths or [])}")
+    Gemini's tools: list_directory, read_file, search_project, git,
+    gemini_search; FileSearch stores are searched automatically when present."""
+    # Sessions are keyed by MCP session id — nothing sensible to do without one.
+    if ctx is None:
+        return "Error: consult_gemini requires an active MCP session (ctx is None)."
+
+    await ctx.debug(f"consult_gemini: model={model}, session={ctx.session_id}, files={len(file_paths or [])}")
+
+    # Validate thinking early — before paying for a Lite exploration phase.
+    if thinking is not None:
+        if not _THINKING_LEVELS.get(thinking.lower()):
+            return f"Error: Invalid thinking level '{thinking}'. Must be one of: minimal, low, medium, high."
 
     # Determine synthesis model — all recognized aliases except "lite" get Lite explore first
     if model == "auto":
@@ -1663,7 +1822,9 @@ async def consult_gemini(
     elif model in ("flash", "pro"):
         synth_model = model
     elif model == "lite":
-        # Direct pass-through, no explore phase (Lite doesn't support thinking)
+        # Direct pass-through, no explore phase.
+        if thinking is not None:
+            return "Error: model='lite' does not support thinking. Use 'flash' or 'pro'."
         return await _consult(
             query, ctx, "lite", file_paths,
             media_paths, file_uris, json_mode, response_schema, cached_content
@@ -1677,24 +1838,21 @@ async def consult_gemini(
         )
 
     # Phase 1: Lite explores (aggressive tool use, loads full file contents)
-    if ctx:
-        await ctx.info("Phase 1: Lite exploration...")
+    await ctx.info("Phase 1: Lite exploration...")
     explore_query = _EXPLORE_PROMPT.format(query=query)
     explore_result = await _consult(
         explore_query, ctx, "lite", file_paths,
-        media_paths, file_uris, False, None, cached_content,
+        media_paths, file_uris, False, None, None,  # caches are model-bound, explore runs on lite
         role="explorer"
     )
 
-    # Check for internal system errors (plain str return = system failure)
-    # ToolResult means the model responded — even if its text mentions "Error"
-    if isinstance(explore_result, str) and explore_result.startswith("Error:"):
+    # Plain str return from _consult always means a system error (by contract).
+    if isinstance(explore_result, str):
         return explore_result
 
     # Phase 2: Synthesis model analyzes (tools available to fill gaps)
     synth_role = "thinker" if synth_model == "pro" else "analyst"
-    if ctx:
-        await ctx.info(f"Phase 2: {synth_model.capitalize()} synthesis (role={synth_role})...")
+    await ctx.info(f"Phase 2: {synth_model.capitalize()} synthesis (role={synth_role})...")
     synthesis_query = _SYNTHESIS_PROMPT.format(query=query)
     return await _consult(
         synthesis_query, ctx, synth_model, None,
@@ -1780,17 +1938,29 @@ async def consult_gemini_oneshot(
 
         parts.append(types.Part.from_text(text=query))
 
-        # Build config
-        config_kwargs: dict[str, Any] = {
-            "temperature": 0.2,
-            "tools": _build_afc_tools(include_search=True),
-            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
-                disable=False,
-                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
-            ),
-            "system_instruction": _compose_instruction(_SYSTEM_AGENT),
-            "http_options": _NO_SDK_RETRY,
-        }
+        # Build config — tools and AFC are included only when json_mode is off.
+        # The Gemini API rejects JSON mode combined with function calling.
+        if not json_mode:
+            # _build_afc_tools may call _ensure_stores_initialized which does network I/O.
+            afc_tools = await loop.run_in_executor(_EXECUTOR, lambda: _build_afc_tools())
+            config_kwargs: dict[str, Any] = {
+                "temperature": 0.2,
+                "tools": afc_tools,
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                    disable=False,
+                    maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
+                ),
+                "system_instruction": _compose_instruction(_SYSTEM_AGENT),
+                "http_options": _NO_SDK_RETRY,
+            }
+        else:
+            # json_mode: omit tools and automatic_function_calling — the Gemini API
+            # rejects JSON mode combined with function calling.
+            config_kwargs = {
+                "temperature": 0.2,
+                "system_instruction": _compose_instruction(_SYSTEM_AGENT),
+                "http_options": _NO_SDK_RETRY,
+            }
         if cached_content:
             config_kwargs["cached_content"] = cached_content
         if json_mode:
@@ -1806,8 +1976,7 @@ async def consult_gemini_oneshot(
         if _thinking is None and resolved_model == MODEL_PRO:
             _thinking = "high"
         if _thinking is not None:
-            _level_map = {"minimal": "MINIMAL", "low": "LOW", "medium": "MEDIUM", "high": "HIGH"}
-            sdk_level = _level_map.get(_thinking.lower())
+            sdk_level = _THINKING_LEVELS.get(_thinking.lower())
             if not sdk_level:
                 return f"Error: Invalid thinking level '{_thinking}'. Must be one of: minimal, low, medium, high."
             config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=sdk_level)
@@ -1851,7 +2020,7 @@ async def consult_gemini_oneshot(
             return f"Error: {e}"
 
 
-@mcp.tool(annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True))
+@mcp.tool(timeout=120, annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True))
 def upload_file(
     file_path: Annotated[str, Field(description="Path to the local file to upload")],
     display_name: Annotated[str | None, Field(default=None, description="Display name in the Files API (defaults to filename)")] = None,
@@ -1875,7 +2044,7 @@ def upload_file(
         return f"Error: {e}"
 
 
-@mcp.tool(annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True))
+@mcp.tool(timeout=60, annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True))
 def create_context_cache(
     file_uris: Annotated[list[str], Field(description="Gemini File API URIs (from upload_file)")],
     model: Annotated[str, Field(default="flash", description="Model alias or explicit version ID")] = "flash",
@@ -1977,7 +2146,7 @@ def delete_file_store(
         return f"Error: {e}"
 
 
-@mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
+@mcp.tool(timeout=120, annotations=ToolAnnotations(openWorldHint=True))
 def upload_to_file_store(
     store_name: Annotated[str, Field(description="Store resource name (from create_file_store)")],
     file_path: Annotated[str, Field(description="Path to the local file to upload")],
@@ -2111,7 +2280,7 @@ def _generate_image_nano_banana(
 NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH, "gemini-3-pro-image-preview", "gemini-2.5-flash-image"}
 
 
-@mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
+@mcp.tool(timeout=300, annotations=ToolAnnotations(openWorldHint=True))
 def generate_image(
     prompt: Annotated[str, Field(description="Text description of the image to generate")],
     output_path: Annotated[str, Field(description="File path to save the generated image")],
@@ -2128,17 +2297,17 @@ def generate_image(
         aspect_ratio: Aspect ratio (e.g. "1:1", "16:9", "9:16", "4:3", "3:4").
         image_size: Output size for Nano Banana only (e.g. "1024x1024"). Not supported by Imagen.
     """
+    resolved = MODEL_ALIASES.get(model.lower(), model)
+    if resolved not in NANO_BANANA_MODELS and image_size:
+        return f"Error: image_size is only supported by Nano Banana models (nano-pro, nano-flash), not {resolved}"
     err = _validate_output_path(output_path)
     if err:
         return err
     client = get_client()
-    resolved = MODEL_ALIASES.get(model.lower(), model)
     try:
         if resolved in NANO_BANANA_MODELS:
             image_bytes = _generate_image_nano_banana(client, resolved, prompt, aspect_ratio, image_size)
         else:
-            if image_size:
-                return f"Error: image_size is only supported by Nano Banana models (nano-pro, nano-flash), not {resolved}"
             image_bytes = _generate_image_imagen(client, resolved, prompt, aspect_ratio)
 
         Path(output_path).write_bytes(image_bytes)
@@ -2147,7 +2316,7 @@ def generate_image(
         return f"Error: {e}"
 
 
-@mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
+@mcp.tool(timeout=180, annotations=ToolAnnotations(openWorldHint=True))
 def generate_speech(
     text: Annotated[str, Field(description="Text to synthesize into speech")],
     output_path: Annotated[str, Field(description="File path to save the generated audio (.wav)")],
@@ -2191,9 +2360,9 @@ def generate_speech(
                     audio_bytes += part.inline_data.data
 
         if audio_bytes:
-            # Gemini TTS returns raw PCM (16-bit, 24kHz, mono). 
-            # If saving as .wav, we must add the header.
-            if output_path.lower().endswith(".wav") and not audio_bytes.startswith(b"RIFF"):
+            # Gemini TTS returns raw PCM (16-bit, 24kHz, mono).
+            # The early return above guarantees output_path ends with .wav.
+            if not audio_bytes.startswith(b"RIFF"):
                 with io.BytesIO() as wav_io:
                     with wave.open(wav_io, "wb") as wav_file:
                         wav_file.setnchannels(1)      # Mono
@@ -2469,7 +2638,7 @@ def main() -> None:
         action="store_true",
         help="Exclude the built-in default system instruction",
     )
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     if args.api_key_file:
         _cli_key_file = args.api_key_file

@@ -28,9 +28,9 @@ Gemini catches real issues — see git history for proof.
 ┌─────────────────────────────────────────────────────┐
 │                 gpal Server                         │
 │                                                     │
-│  ┌─────────────────┐  ┌─────────────────┐          │
-│  │ consult_gemini  │  │ consult_oneshot │  ← Tools │
-│  └────────┬────────┘  └────────┬────────┘          │
+│  ┌─────────────────┐  ┌────────────────────────┐    │
+│  │ consult_gemini  │  │ consult_gemini_oneshot │  ← Tools │
+│  └────────┬────────┘  └───────────┬────────────┘    │
 │           │                    │                    │
 │           └──────────┬─────────┘                    │
 │                      ▼                              │
@@ -46,7 +46,8 @@ Gemini catches real issues — see git history for proof.
 │                                                     │
 │  Gemini has internal tools:                         │
 │  • list_directory  • read_file  • search_project   │
-│  • url_context    • file_search (when stores exist) │
+│  • git  • gemini_search                            │
+│  • file_search (when stores exist)                 │
 │                                                     │
 │  Automatic Function Calling enabled                 │
 │  (Gemini autonomously explores the codebase)        │
@@ -63,9 +64,10 @@ gpal/
 ├── tests/
 │   ├── test_tools.py     # Unit tests (pytest)
 │   ├── test_server.py    # Integration tests (FastMCP Client, in-process)
-│   ├── test_agentic.py   # Manual: autonomous exploration
-│   ├── test_connectivity.py  # Manual: API ping
-│   └── test_switching.py     # Manual: Flash→Pro history
+│   ├── test_unbundled.py # Integration tests: _gemini_search, _gemini_code_exec (skipped without API key)
+│   ├── test_agentic.py   # Manual smoke test: autonomous license discovery (run directly)
+│   ├── test_connectivity.py  # Manual smoke test: ping flash + pro (run directly)
+│   └── test_switching.py     # Manual smoke test: Flash→Pro history migration (run directly)
 └── pyproject.toml        # Dependencies & entry point
 ```
 
@@ -115,8 +117,20 @@ and converts `TimeoutError` to `McpError(-32000)`.
 |------|---------|-----------|
 | `consult_gemini` | 660s | Unified tool (auto mode: Lite explore + synthesis) |
 | `consult_gemini_oneshot` | 600s | Stateless queries (Pro+thinking can be slow) |
-| `rebuild_index` | 300s | Large index rebuilds |
-| All others | None | Quick sync operations |
+| `generate_image` | 300s | Image generation can be slow for large/complex prompts |
+| `generate_speech` | 180s | TTS synthesis latency |
+| `gemini_search` | 120s | Network round-trip to Google Search |
+| `gemini_code_exec` | 120s | Code execution sandbox startup + run time |
+| `upload_file` | 120s | File upload to Gemini Files API |
+| `upload_to_file_store` | 120s | File upload + indexing initiation |
+| `create_context_cache` | 60s | Cache creation API call |
+| `create_batch` | 120s | Batch job submission |
+| `get_batch` | 30s | Status poll |
+| `list_batches` | 30s | List query |
+| `get_batch_results` | 60s | Result fetch (may be large) |
+| `cancel_batch` | 30s | Cancellation request |
+| `delete_batch` | 30s | Deletion request |
+| All others | None | Quick sync/local operations |
 
 **Rich ToolResult** — `_consult` returns `ToolResult` (from `fastmcp.tools.tool`) on success
 instead of plain `str`. Provides `structured_content` (model ID) and `meta` (model, session_id,
@@ -252,15 +266,19 @@ Files are uploaded to FileSearch stores, where Google handles chunking, embeddin
 # Install dev dependencies first
 uv sync --all-extras
 
-# Unit tests (no API key needed)
-uv run pytest tests/test_server.py tests/test_tools.py -v
+# Unit + in-process integration tests (no API key needed)
+uv run pytest tests/test_server.py tests/test_tools.py tests/test_config.py tests/test_git_tools.py -v
 
-# Manual integration tests (requires GEMINI_API_KEY)
+# API-gated integration tests (skipped automatically when no key is set)
 # ⚠️ These make live API calls and will incur Gemini API costs!
 export GEMINI_API_KEY="..."
-uv run python tests/test_connectivity.py
-uv run python tests/test_agentic.py
-uv run python tests/test_switching.py
+uv run pytest tests/test_unbundled.py -v
+
+# Manual smoke tests (run directly, not via pytest)
+# ⚠️ These make live API calls and will incur Gemini API costs!
+uv run python tests/test_connectivity.py   # ping flash + pro
+uv run python tests/test_agentic.py        # autonomous license file discovery
+uv run python tests/test_switching.py      # flash->pro history migration
 ```
 
 ## Private API Usage

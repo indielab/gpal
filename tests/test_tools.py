@@ -6,7 +6,7 @@ from google.genai import types
 from gpal.server import (
     list_directory, read_file, search_project, detect_mime_type, MIME_TYPES,
     create_batch, get_batch, list_batches, get_batch_results, cancel_batch, delete_batch,
-    _number_lines, _build_file_context,
+    _number_lines, _build_file_context, generate_image,
 )
 
 def test_list_directory(tmp_path, monkeypatch):
@@ -20,7 +20,7 @@ def test_list_directory(tmp_path, monkeypatch):
 
     # Test listing current directory
     results = list_directory(".")
-    assert "subdir" in results
+    assert "subdir/" in results   # directories get trailing "/"
     assert "file1.txt" in results
     assert "file2.py" in results
     assert len(results) == 3
@@ -111,6 +111,20 @@ def test_read_file_error(tmp_path, monkeypatch):
     result = read_file("this_file_does_not_exist_at_all.txt")
     assert "does not exist" in result
 
+def test_read_file_limit_zero_returns_error(tmp_path, monkeypatch):
+    (tmp_path / "t.txt").write_text("one\ntwo\n")
+    monkeypatch.chdir(tmp_path)
+    result = read_file("t.txt", limit=0)
+    assert isinstance(result, str)
+    assert "error" in result.lower()
+
+def test_read_file_limit_negative_returns_error(tmp_path, monkeypatch):
+    (tmp_path / "t.txt").write_text("one\ntwo\n")
+    monkeypatch.chdir(tmp_path)
+    result = read_file("t.txt", limit=-5)
+    assert isinstance(result, str)
+    assert "error" in result.lower()
+
 
 # --- _build_file_context (inline file_paths) ---
 
@@ -195,6 +209,30 @@ def test_detect_mime_type_unknown():
     assert detect_mime_type("file.xyz") is None
     assert detect_mime_type("noextension") is None
     assert detect_mime_type(".hidden") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_image validation tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_generate_image_imagen_image_size_error_does_not_create_dir(tmp_path, monkeypatch):
+    """imagen model + image_size must error before _validate_output_path creates dirs."""
+    monkeypatch.chdir(tmp_path)
+    nonexistent_subdir = tmp_path / "new_subdir"
+    output_path = str(nonexistent_subdir / "out.png")
+
+    result = generate_image(
+        prompt="a cat",
+        output_path=output_path,
+        model="imagen",
+        image_size="1024x1024",
+    )
+
+    assert "error" in result.lower()
+    assert "image_size" in result
+    assert not nonexistent_subdir.exists(), (
+        "Output directory must NOT be created when validation fails before _validate_output_path"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
